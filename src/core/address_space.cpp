@@ -548,9 +548,15 @@ struct AddressSpace::Impl {
         }
 
         const VAddr virtual_end = virtual_addr + size;
-        auto it = --regions.upper_bound(virtual_addr);
-        ASSERT_MSG(it != regions.end(), "addr {:#x} out of bounds", virtual_addr);
-        for (; it->first < virtual_end; it++) {
+        if (regions.empty() || virtual_end <= regions.begin()->first) {
+            return;
+        }
+
+        auto it = regions.upper_bound(virtual_addr);
+        if (it != regions.begin()) {
+            --it;
+        }
+        for (; it != regions.end() && it->first < virtual_end; it++) {
             if (!it->second.is_mapped) {
                 continue;
             }
