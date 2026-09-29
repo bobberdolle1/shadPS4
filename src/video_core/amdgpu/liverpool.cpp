@@ -911,6 +911,23 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             }
             continue;
         }
+        if (header->type == 0) {
+            const u32 type0_words = header->type0.NumWords();
+            LOG_WARNING(Render_Vulkan,
+                        "ProcessCompute: PM4 Type 0 encountered: raw=0x{:08x} base=0x{:x} count={} acb_size={} is_indirect={}",
+                        header->raw, header->type0.base.Value(), type0_words, acb.size(), is_indirect);
+            for (size_t i = 0; i < std::min<size_t>(acb.size(), 8); ++i) {
+                LOG_WARNING(Render_Vulkan, "  acb[{}] = 0x{:08x}", i, acb[i]);
+            }
+            const u32 skip_dwords = (header->raw == 0) ? 1 : (type0_words + 1);
+            next_dw_off = std::min<u32>(skip_dwords, static_cast<u32>(acb.size()));
+            acb = NextPacket(acb, next_dw_off);
+            if constexpr (!is_indirect) {
+                *queue.read_addr += next_dw_off;
+                *queue.read_addr %= queue.ring_size_dw;
+            }
+            continue;
+        }
 
         if (header->type != 3) {
             // No other types of packets were spotted so far
