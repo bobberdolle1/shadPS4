@@ -14,9 +14,23 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
     const bool anisotropy_enable = instance.IsAnisotropicFilteringSupported() &&
                                    (AmdGpu::IsAnisoFilter(sampler.xy_mag_filter) ||
                                     AmdGpu::IsAnisoFilter(sampler.xy_min_filter));
+    const u32 max_aniso_value = static_cast<u32>(sampler.max_aniso.Value());
+    const bool valid_max_aniso =
+        max_aniso_value <= static_cast<u32>(AmdGpu::AnisoRatio::Sixteen);
+
+    if (anisotropy_enable && !valid_max_aniso) {
+        LOG_WARNING(
+            Render_Vulkan,
+            "Invalid sampler max_aniso={} raw0=0x{:016x} raw1=0x{:016x}; forcing 1x",
+            max_aniso_value,
+            sampler.raw0,
+            sampler.raw1);
+    }
+
     const float max_anisotropy =
-        anisotropy_enable ? std::clamp(sampler.MaxAniso(), 1.0f, instance.MaxSamplerAnisotropy())
-                          : 1.0f;
+        anisotropy_enable && valid_max_aniso
+            ? std::clamp(sampler.MaxAniso(), 1.0f, instance.MaxSamplerAnisotropy())
+            : 1.0f;
     auto border_color = LiverpoolToVK::BorderColor(sampler.border_color_type);
     if (border_color == vk::BorderColor::eFloatCustomEXT &&
         !instance.IsCustomBorderColorSupported()) {
