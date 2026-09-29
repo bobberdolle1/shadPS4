@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "video_core/amdgpu/tiling.h"
+#include "common/logging.h"
 
 #include <bit>
 #include <magic_enum/magic_enum.hpp>
@@ -62,7 +63,9 @@ ArrayMode GetArrayMode(TileMode tile_mode) {
     case TileMode::DisplayLinearGeneral:
         return ArrayMode::ArrayLinearGeneral;
     default:
-        UNREACHABLE_MSG("Unknown tile mode = {}", u32(tile_mode));
+        LOG_WARNING(Render_Vulkan, "Unknown tile mode = {}, falling back to Array2DTiledThin1",
+                    u32(tile_mode));
+        return ArrayMode::Array2DTiledThin1;
     }
 }
 
@@ -101,7 +104,9 @@ MicroTileMode GetMicroTileMode(TileMode tile_mode) {
     case TileMode::Thick3DXThick:
         return MicroTileMode::Thick;
     default:
-        UNREACHABLE_MSG("Unknown tile mode = {}", u32(tile_mode));
+        LOG_WARNING(Render_Vulkan, "Unknown tile mode = {}, falling back to MicroTileMode::Thin",
+                    u32(tile_mode));
+        return MicroTileMode::Thin;
     }
 }
 
@@ -139,7 +144,9 @@ PipeConfig GetPipeConfig(TileMode tile_mode) {
     case TileMode::DisplayLinearGeneral:
         return PipeConfig::P2;
     default:
-        UNREACHABLE_MSG("Unknown tile mode = {}", u32(tile_mode));
+        LOG_WARNING(Render_Vulkan, "Unknown tile mode = {}, falling back to P8_32x32_8x16",
+                    u32(tile_mode));
+        return PipeConfig::P8_32x32_8x16;
     }
 }
 
@@ -176,7 +183,9 @@ PipeConfig GetAltPipeConfig(TileMode tile_mode) {
     case TileMode::DisplayLinearGeneral:
         return PipeConfig::P2;
     default:
-        UNREACHABLE_MSG("Unknown tile mode = {}", u32(tile_mode));
+        LOG_WARNING(Render_Vulkan, "Unknown tile mode = {}, falling back to P16_32x32_8x16",
+                    u32(tile_mode));
+        return PipeConfig::P16_32x32_8x16;
     }
 }
 
@@ -213,7 +222,9 @@ u32 GetSampleSplit(TileMode tile_mode) {
     case TileMode::Thin3DThinPrt:
         return 2;
     default:
-        UNREACHABLE_MSG("Unknown tile mode = {}", u32(tile_mode));
+        LOG_WARNING(Render_Vulkan, "Unknown tile mode = {}, falling back to SampleSplit=1",
+                    u32(tile_mode));
+        return 1;
     }
 }
 
@@ -253,7 +264,9 @@ u32 GetTileSplitHw(TileMode tile_mode) {
     case TileMode::Depth2DThinPrt1K:
         return 1024;
     default:
-        UNREACHABLE_MSG("Unknown tile mode = {}", u32(tile_mode));
+        LOG_WARNING(Render_Vulkan, "Unknown tile mode = {}, falling back to TileSplitHw=64",
+                    u32(tile_mode));
+        return 64;
     }
 }
 
