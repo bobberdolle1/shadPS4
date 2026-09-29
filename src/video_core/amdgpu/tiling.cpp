@@ -3,7 +3,7 @@
 
 #include "common/assert.h"
 #include "video_core/amdgpu/tiling.h"
-#include "common/logging.h"
+#include "common/logging/log.h"
 
 #include <bit>
 #include <magic_enum/magic_enum.hpp>
