@@ -748,6 +748,49 @@ std::span<const SurfaceFormatInfo> SurfaceFormats() {
                                 vk::Format::eBc7UnormBlock),
         CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc7, AmdGpu::NumberFormat::Srgb,
                                 vk::Format::eBc7SrgbBlock),
+        // FMASK formats (used for MSAA color/stencil buffers)
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask8_S2_F1, AmdGpu::NumberFormat::Unorm,
+                                vk::Format::eR8Unorm),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask8_S2_F1, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR8Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask8_S4_F1, AmdGpu::NumberFormat::Unorm,
+                                vk::Format::eR8Unorm),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask8_S4_F1, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR8Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask8_S8_F1, AmdGpu::NumberFormat::Unorm,
+                                vk::Format::eR8Unorm),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask8_S8_F1, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR8Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask8_S2_F2, AmdGpu::NumberFormat::Unorm,
+                                vk::Format::eR8Unorm),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask8_S2_F2, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR8Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask8_S4_F2, AmdGpu::NumberFormat::Unorm,
+                                vk::Format::eR8Unorm),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask8_S4_F2, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR8Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask8_S4_F4, AmdGpu::NumberFormat::Unorm,
+                                vk::Format::eR8Unorm),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask8_S4_F4, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR8Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask16_S16_F1, AmdGpu::NumberFormat::Unorm,
+                                vk::Format::eR16Unorm),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask16_S16_F1, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR16Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask16_S8_F2, AmdGpu::NumberFormat::Unorm,
+                                vk::Format::eR16Unorm),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask16_S8_F2, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR16Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask32_S16_F2, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR32Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask32_S8_F4, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR32Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask32_S8_F8, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR32Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask64_S16_F4, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR32G32Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask64_S16_F8, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR32G32Uint),
     };
     return formats;
 }
@@ -784,8 +827,11 @@ vk::Format SurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat nu
     vk::Format result = surface_format_table[GetSurfaceFormatTableIndex(data_format, num_format)];
     bool found =
         result != vk::Format::eUndefined || data_format == AmdGpu::DataFormat::FormatInvalid;
-    ASSERT_MSG(found, "Unknown data_format={} and num_format={}", static_cast<u32>(data_format),
-               static_cast<u32>(num_format));
+    if (!found) {
+        LOG_WARNING(Render_Vulkan, "Unknown data_format={} and num_format={}, falling back to eUndefined",
+                    static_cast<u32>(data_format), static_cast<u32>(num_format));
+        return vk::Format::eUndefined;
+    }
     return result;
 }
 
