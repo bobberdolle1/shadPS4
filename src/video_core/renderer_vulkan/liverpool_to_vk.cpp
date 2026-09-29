@@ -391,7 +391,9 @@ vk::SamplerMipmapMode MipFilter(AmdGpu::MipFilter filter) {
     case AmdGpu::MipFilter::None:
         return vk::SamplerMipmapMode::eNearest;
     default:
-        UNREACHABLE();
+        LOG_WARNING(Render_Vulkan, "Unsupported MipFilter {}, falling back to Nearest",
+                    static_cast<u32>(filter));
+        return vk::SamplerMipmapMode::eNearest;
     }
 }
 
