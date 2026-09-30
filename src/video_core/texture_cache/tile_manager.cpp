@@ -195,7 +195,14 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
 
 std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* in_buffer,
                                                        u64 in_offset, const ImageInfo& info) {
-    if (!info.props.is_tiled) {
+    constexpr u64 MAX_TILING_BYTES = 256u * 1024u * 1024u;
+    if (!info.props.is_tiled || info.num_bits == 0 || info.guest_size == 0 ||
+        info.guest_size > MAX_TILING_BYTES) {
+        if (info.num_bits == 0 || info.guest_size > MAX_TILING_BYTES) {
+            LOG_WARNING(Render_Vulkan,
+                        "[softclamp] DetileImage skipped: guest_size={:#x} ({} MB) num_bits={}",
+                        info.guest_size, info.guest_size >> 20, info.num_bits);
+        }
         return {in_buffer, in_offset};
     }
 
@@ -280,7 +287,14 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
 void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
                             const VideoCore::Buffer* out_buffer, u64 out_offset) {
     const auto& info = in_image.info;
-    if (!info.props.is_tiled) {
+    constexpr u64 MAX_TILING_BYTES = 256u * 1024u * 1024u;
+    if (!info.props.is_tiled || info.num_bits == 0 || info.guest_size == 0 ||
+        info.guest_size > MAX_TILING_BYTES) {
+        if (info.num_bits == 0 || info.guest_size > MAX_TILING_BYTES) {
+            LOG_WARNING(Render_Vulkan,
+                        "[softclamp] TileImage skipped: guest_size={:#x} ({} MB) num_bits={}",
+                        info.guest_size, info.guest_size >> 20, info.num_bits);
+        }
         for (auto& copy : buffer_copies) {
             copy.bufferOffset += out_offset;
         }
