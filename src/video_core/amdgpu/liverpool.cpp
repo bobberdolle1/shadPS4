@@ -1132,9 +1132,23 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             // const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
             break;
         }
-        default:
-            UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
-                            static_cast<u32>(opcode), header->type3.NumWords());
+        default: {
+            // GT7 can expose not-yet-written async-compute ring data as an unknown packet.
+            // The reference fork observed this exact opcode/count pair in run 128; aborting
+            // the emulator loses the session, while advancing by the declared packet size
+            // contains the bad ring word.
+            static u32 unknown_pm4_logged = 0;
+            if (unknown_pm4_logged < 16) {
+                ++unknown_pm4_logged;
+                LOG_CRITICAL(Lib_GnmDriver,
+                             "Unknown ACB PM4 type 3 opcode {:#x} with count {} - skipping the "
+                             "packet ({} so far)",
+                             static_cast<u32>(opcode), header->type3.NumWords(),
+                             unknown_pm4_logged);
+            }
+            break;
+        }
+
         }
 
         acb = NextPacket(acb, next_dw_off);
