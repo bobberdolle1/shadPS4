@@ -135,7 +135,22 @@ struct PageManager::Impl {
         // Iterate requested pages
         const u64 aligned_addr = page_start << PM_PAGE_BITS;
         const u64 aligned_end = page_end << PM_PAGE_BITS;
+        if (aligned_addr < 0x200000 && !rasterizer->IsMapped(aligned_addr, aligned_end - aligned_addr)) {
+            LOG_CRITICAL(Render,
+                         "[softclamp] refusing to (un)track region {:#x} - {:#x} (below guest "
+                         "memory floor and unmapped - torn descriptor registration)",
+                         aligned_addr, aligned_end);
+            return;
+        }
+
         if (!rasterizer->IsMapped(aligned_addr, aligned_end - aligned_addr)) {
+            if (aligned_end - aligned_addr > (u64{1} << 28)) {
+                LOG_CRITICAL(Render,
+                             "[softclamp] refusing to (un)track region {:#x} - {:#x} ({} MB, "
+                             "not fully GPU mapped - torn descriptor registration)",
+                             aligned_addr, aligned_end, (aligned_end - aligned_addr) >> 20);
+                return;
+            }
             LOG_WARNING(Render,
                         "Tracking memory region {:#x} - {:#x} which is not fully GPU mapped.",
                         aligned_addr, aligned_end);
