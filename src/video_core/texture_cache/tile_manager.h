@@ -20,6 +20,8 @@ namespace VideoCore {
 struct ImageInfo;
 struct Image;
 
+inline constexpr u64 MaxTilingBytes = 256u * 1024u * 1024u;
+
 class TileManager {
     struct TilingKey {
         AmdGpu::TileMode tile_mode;

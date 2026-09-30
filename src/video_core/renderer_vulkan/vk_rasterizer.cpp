@@ -846,6 +846,26 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             auto& [image_id, desc] = image_bindings.emplace_back(
                 std::piecewise_construct, std::tuple{}, std::tuple{tsharp, image_desc});
 
+            // A garbage T# can describe a multi-gigabyte tiled footprint even when its
+            // dimensions look plausible. Reject it before FindImage creates, registers, and
+            // synchronizes an image that TileManager will later refuse to detile.
+            if (desc.info.props.is_tiled &&
+                desc.info.guest_size > VideoCore::MaxTilingBytes) {
+                static u32 monster_image_logged = 0;
+                if (monster_image_logged < 16) {
+                    ++monster_image_logged;
+                    LOG_CRITICAL(
+                        Render_Vulkan,
+                        "Rejecting tiled T# address={:#x}, guest_size={:#x} ({} MB), "
+                        "extent={}x{}x{}, layers={}, levels={} before image creation ({} so far)",
+                        desc.info.guest_address, desc.info.guest_size,
+                        desc.info.guest_size >> 20, desc.info.size.width, desc.info.size.height,
+                        desc.info.size.depth, desc.info.resources.layers,
+                        desc.info.resources.levels, monster_image_logged);
+                }
+                continue;
+            }
+
             if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
                 ASSERT(num_bindings == 1);
                 desc.view_info.range.base.level += image_desc.constant_mip_index;
