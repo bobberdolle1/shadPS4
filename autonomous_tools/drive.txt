@@ -1,0 +1,16 @@
+# CUSA49696 scripted pad: <seconds> <cross> <r2> <l2> <left_x>, each 0..255
+# Silent until the track is loaded, then confirm START and hold throttle.
+# Navigation to the race is done by the harness key schedule, not by this script.
+0.0   0 0   0   128
+196.0 1 0   0   128
+198.0 0 0   0   128
+201.0 0 210 0   128
+206.0 0 200 0   120
+212.0 0 190 0   132
+218.0 0 200 0   128
+224.0 0 190 0   128
+230.0 0 185 0   126
+236.0 0 180 0   128
+242.0 0 180 0   128
+248.0 0 170 0   128
+254.0 0 170 0   128

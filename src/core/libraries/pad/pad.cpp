@@ -15,6 +15,10 @@
 #include <algorithm>
 #include <array>
 #include <optional>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <vector>
 
 namespace Libraries::Pad {
 
@@ -429,6 +433,69 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
     return num;
 }
 
+namespace {
+// Dev tool so an unattended run can actually drive. Set CUSA49696_PAD_SCRIPT to a file of
+// whitespace separated rows "<seconds> <cross> <r2> <l2> <left_x>", each 0..255; the last
+// row whose time has passed is applied. PS4's virtual pad API is stubbed and the keyboard is
+// not mapped to pad buttons, so without this an automated run can never steer or accelerate.
+struct ScriptedPadRow {
+    double t;
+    int cross;
+    int r2;
+    int l2;
+    int lx;
+};
+
+const std::vector<ScriptedPadRow>& ScriptedPadRows() {
+    static const std::vector<ScriptedPadRow> rows = [] {
+        std::vector<ScriptedPadRow> parsed;
+        const char* path = std::getenv("CUSA49696_PAD_SCRIPT");
+        if (!path) {
+            return parsed;
+        }
+        std::ifstream file{path};
+        if (!file) {
+            LOG_ERROR(Lib_Pad, "Could not open CUSA49696_PAD_SCRIPT '{}'", path);
+            return parsed;
+        }
+        double t;
+        int cross, r2, l2, lx;
+        while (file >> t >> cross >> r2 >> l2 >> lx) {
+            parsed.push_back({t, cross, r2, l2, lx});
+        }
+        return parsed;
+    }();
+    return rows;
+}
+
+void ApplyScriptedPad(Input::State& state) {
+    const auto& rows = ScriptedPadRows();
+    if (rows.empty()) {
+        return;
+    }
+    static const auto start = std::chrono::steady_clock::now();
+    const double now =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    const ScriptedPadRow* active = nullptr;
+    for (const auto& row : rows) {
+        if (row.t > now) {
+            break;
+        }
+        active = &row;
+    }
+    if (!active) {
+        return;
+    }
+    using Axis = Input::Axis;
+    state.axes[static_cast<u32>(Axis::TriggerRight)] = active->r2;
+    state.axes[static_cast<u32>(Axis::TriggerLeft)] = active->l2;
+    state.axes[static_cast<u32>(Axis::LeftX)] = active->lx;
+    state.buttonsState = active->cross != 0 ? Libraries::Pad::OrbisPadButtonDataOffset::Cross
+                                            : Libraries::Pad::OrbisPadButtonDataOffset(0);
+}
+} // namespace
+
+
 int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
     LOG_TRACE(Lib_Pad, "called");
     if (pData == nullptr || num < 1 || num > ORBIS_PAD_MAX_DATA_NUM) {
@@ -441,6 +508,9 @@ int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
     auto& controller = *it->second;
     std::array<Input::State, ORBIS_PAD_MAX_DATA_NUM> states;
     const int ret_num = controller.ReadStates(states.data(), num);
+    if (ret_num > 0) {
+        ApplyScriptedPad(states[0]);
+    }
     return ProcessStates(pData, states.data(), ret_num);
 }
 
