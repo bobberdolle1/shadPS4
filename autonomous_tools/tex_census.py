@@ -2,10 +2,13 @@ import json
 import os
 import struct
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from paths import REPO  # noqa: E402
 import renderdoc as rd
 
 root = Path(os.environ.get('SCAN_DIR',
-                           'E:/programming/shadPS4/autonomous_logs/xhigh-renderdoc-title-65s'))
+                           str(REPO / 'autonomous_logs/xhigh-renderdoc-title-65s')))
 meta = json.loads((root / 'result.json').read_text())
 cap = rd.OpenCaptureFile()
 controller = None

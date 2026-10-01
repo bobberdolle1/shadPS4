@@ -7,7 +7,9 @@ import sys
 import time
 import renderdoc as rd
 
-root = Path('E:/programming/shadPS4')
+# Paths come from paths.py so this script is not tied to one machine's drive layout.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from paths import EXE, GAME_EBOOT, REPO as root  # noqa: E402
 out = root / 'autonomous_logs/xhigh-verify-clean-65s'
 if out.exists():
     shutil.rmtree(out)
@@ -16,8 +18,8 @@ mods = []
 for name, value in [('VK_ADD_IMPLICIT_LAYER_PATH', str(root / 'autonomous_tools/RenderDoc_1.46_64')),
                     ('ENABLE_VULKAN_RENDERDOC_CAPTURE', '1')]:
     mods.append(rd.EnvironmentModification(rd.EnvMod.Set, rd.EnvSep.NoSep, name, value))
-result = rd.ExecuteAndInject(str(root / 'build-clang/shadps4.exe'), str(root),
-                             '-g E:/Games/emulators/ps4/roms/CUSA49696/eboot.bin -f false',
+result = rd.ExecuteAndInject(str(EXE), str(root),
+                             f'-g {GAME_EBOOT} -f false',
                              mods, str(out / 'probe'), rd.CaptureOptions(), False)
 info = {'version': rd.GetVersionString(), 'launch_result': str(result.result), 'ident': result.ident,
         'messages': []}

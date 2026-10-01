@@ -5,8 +5,9 @@ import time
 from ctypes import wintypes
 from pathlib import Path
 
-root = Path('E:/programming/shadPS4')
-shots = Path(r'C:\Users\kiril\AppData\Roaming\shadPS4\screenshots')
+# Paths come from paths.py so this script is not tied to one machine's drive layout.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from paths import EXE, GAME_EBOOT, REPO as root, SCREENSHOTS as shots  # noqa: E402
 shots.mkdir(parents=True, exist_ok=True)
 before = set(shots.glob('*.png'))
 
@@ -41,8 +42,8 @@ def enum_cb(hwnd, _lparam):
     return True
 
 
-argv = [str(root / 'build-clang/shadps4.exe'), str(root),
-        '-g', 'E:/Games/emulators/ps4/roms/CUSA49696/eboot.bin', '-f', 'false']
+argv = [str(EXE), str(root),
+        '-g', str(GAME_EBOOT), '-f', 'false']
 proc = subprocess.Popen(argv, cwd=str(root))
 try:
     time.sleep(85)
