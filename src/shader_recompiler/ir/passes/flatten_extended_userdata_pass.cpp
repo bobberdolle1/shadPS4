@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <functional>
+#include <string>
 #include <unordered_map>
 #include <boost/container/flat_map.hpp>
 #include <queue>
@@ -29,6 +31,12 @@ using namespace Xbyak::util;
 
 static Xbyak::CodeGenerator g_srt_codegen(32_MB);
 static const u8* g_srt_codegen_start = nullptr;
+
+// Per-shader counters: how many descriptor offsets the SRT walker tried to compute, and how
+// many of those hit an unsupported construction. Needed to tell a shader that loses a couple
+// of descriptors from one that loses nearly all of them.
+static u64 g_offset_total = 0;
+static u64 g_offset_failed = 0;
 
 namespace Shader {
 
@@ -511,6 +519,7 @@ static bool IsAllowedOffsetInstruction(const IR::Inst* inst) {
 static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& pass_info,
                           const IR::Value& off_dw) {
     ASSERT(reg != ecx && reg != edx);
+    ++g_offset_total;
     auto inst = off_dw.Inst();
     switch (inst->GetOpcode()) {
     case IR::Opcode::GetUserData:
@@ -560,8 +569,34 @@ static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& p
         ABORT_ON_FAILURE(EmitComputeOffsetBitFieldUExtract(c, reg, pass_info, inst));
         return true;
     default:
-        LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, {}",
-                  magic_enum::enum_name(inst->GetOpcode()));
+        if (inst->GetOpcode() == IR::Opcode::Phi) {
+            // A nested Phi means the alternative is picked by control flow, so the offset is
+            // only known at runtime. Walk the whole chain down to its leaves: the shape
+            // decides whether one alternative can simply be chosen instead.
+            std::function<void(const IR::Value&, int)> dump_phi = [&](const IR::Value& v, int depth) {
+                const auto* v_inst = v.Inst();
+                if (v_inst == nullptr) {
+                    LOG_ERROR(Render_Recompiler, "{}(no defining instruction)", std::string(depth, ' '));
+                    return;
+                }
+                if (v_inst->GetOpcode() != IR::Opcode::Phi) {
+                    LOG_ERROR(Render_Recompiler, "{}{}", std::string(depth, ' '),
+                              magic_enum::enum_name(v_inst->GetOpcode()));
+                    return;
+                }
+                LOG_ERROR(Render_Recompiler, "{}Phi", std::string(depth, ' '));
+                for (u32 i = 0; i < v_inst->NumArgs(); i++) {
+                    dump_phi(v_inst->Arg(i), depth + 2);
+                }
+            };
+            dump_phi(off_dw, 0);
+        }
+        ++g_offset_failed;
+        LOG_ERROR(Render_Recompiler,
+                  "Unexpected instruction for offset computation, {} [{} of {} failed in this "
+                  "shader, {}%]",
+                  magic_enum::enum_name(inst->GetOpcode()), g_offset_failed, g_offset_total,
+                  g_offset_total ? (g_offset_failed * 100 / g_offset_total) : 0);
         return false;
     }
 }
@@ -748,6 +783,8 @@ void SimplifyReadConstAddressAdd(IR::Inst& inst) {
 void FlattenExtendedUserdataPass(IR::Program& program) {
     auto& post_order = program.post_order_blocks;
     PassInfo pass_info;
+    g_offset_total = 0;
+    g_offset_failed = 0;
 
     // traverse at end and assign offsets to duplicate readconsts, using
     // vn_to_inst as the source
