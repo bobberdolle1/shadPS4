@@ -110,6 +110,77 @@ The consequence is that **this cannot be fixed with a small patch to `ComputeOff
 requires moving descriptor reads to the GPU for the affected shaders, which is the work
 that was queued when this archive was made.
 
+### How the flatten path actually fits together
+
+Mapped after the archive was published; worth recording because it corrects two earlier
+conclusions. All paths relative to the repository root.
+
+Descriptor dwords are copied on the **host**, at compile time, into
+`Shader::Info::flattened_ud_buf`, by an x86-64 "walker" emitted into a global arena
+(`flatten_extended_userdata_pass.cpp:32,43-47`). Its signature is
+`void PS4_SYSV_ABI (*)(const u32* user_data, u32* flat_dst)` (`ir/passes/srt.h:16`) — so
+**`rdi` is `user_data` and `rsi` is the flat destination**. It is invoked from
+`Info::RefreshFlatBuf()` (`info.h:167-183`), which memsets the buffer, copies live
+user_data, then calls `srt_info.walker_func(user_data, flat_dst)`.
+
+Each `ReadConst` then carries its assigned flat slot **baked into its flags** as a
+compile-time-constant dword offset, and **slot 0 means "unresolved"**. The end of the chain:
+
+```
+scalar_memory.cpp:43-87   S_LOAD_DWORD / S_BUFFER_LOAD_DWORD
+                          index = Imm32 | ShiftRightLogical(GetScalarReg(off_sgpr), 2)
+resource_discover_pass.cpp:244-352   records the descriptor, tags bindless producers
+flatten_extended_userdata_pass.cpp   builds the host walker, assigns flat slots
+resource_patching_pass.cpp:164-203   SharpReference -> SharpFetch<T>{offsets, immediates}
+emit_spirv_context_get_set.cpp:54-60 flatbuf_off_dw == 0 ? read_const_dynamic
+                                                          : EmitFlatbufferLoad(const)
+vk_rasterizer.cpp:731-737            uploads flattened_ud_buf as the Flatbuf SSBO
+resource.h:96-215 / vk_rasterizer    SharpFetch::Fetch -> real Vulkan images/samplers
+```
+
+Two corrections to what this document previously said:
+
+1. **`read_const_dynamic` already exists** (`spirv_emit_context.cpp:1246`, registered at
+   `:1273-1297`). It is already the fallback for unresolved slots, so "build GPU-side
+   descriptor reads" was the wrong framing — the GPU path is present. The open question is
+   why the fallback does not yield valid descriptors for these shaders. Unresolved slots
+   degrade to the BDA path or to `SharpFetch::summary == Invalid`, i.e. a null Vulkan
+   descriptor, which is the missing texture.
+2. There is **no `FlattenedUserData` struct** in the tree. `srt.h` holds only
+   `PersistentSrtInfo` (`{walker_func, walker_func_size, flattened_bufsize_dw = 16}`, lines
+   19-33) and the `PFN_SrtWalker` typedef.
+
+### Two concrete leads, in order of cost
+
+**A. Reorder the passes — cheap, and it may remove most of the `Phi` load.**
+`recompiler.cpp` runs them in this order: `ResourceDiscoverPass` (109),
+`FlattenExtendedUserdataPass` (110), `ResourcePatchingPass` (112),
+`PhiSimplificationPass` (117), `LowerPhisToRegsPass` (126), `CollectShaderInfoPass` (143).
+**The flatten pass runs before the two Phi passes.** So the walker is asked to resolve
+values while Phis are still live in the IR. Running the flatten after
+`LowerPhisToRegsPass` — or at least letting those passes simplify the offset expression
+first — could collapse a large share of the 6580 `Phi` hits with no new infrastructure at
+all. This should be tried before anything else; it is the cheapest thing on the list and
+the hypothesis is well supported by the pass ordering.
+
+**B. `GetAttributeU32` is the real floor.** Whatever is done about `Phi`, an index taken
+from a vertex attribute still cannot be folded statically. That one genuinely needs the
+GPU-side window read.
+
+### Two side notes for whoever continues
+
+- `SrtGvnTable::IsArgHashInst` (`ir/srt_gvn_table.h:41-58`) whitelists exactly the sixteen
+  opcodes `ComputeOffset` supports. Anything outside that set gets a fresh value number
+  and is never deduplicated. **Any opcode added to `ComputeOffset` must be added here too**,
+  or the dedup assumptions silently diverge.
+- There are **two** failure sites, not one. The inner one is `ComputeOffset` returning
+  false; the outer one is `PushPtr` (line 604), which leaves `rdi` pushed and half-emitted
+  code in the stream when the inner call fails. That is a stack imbalance in the emitted
+  walker and is worth auditing independently of the descriptor problem.
+- The walker is serialised raw and re-registered on load
+  (`vk_pipeline_serialization.cpp:425-446`), so any change to emitted code needs the
+  pipeline cache invalidated or stale walkers will keep running.
+
 ## Relation to nikmparis217-ux/shadPS4
 
 The GT7 research tree at `github.com/nikmparis217-ux/shadPS4` is where the mechanism for
