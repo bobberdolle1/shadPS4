@@ -28,9 +28,7 @@ env = dict(os.environ)
 if stat:
     env['CUSA49696_DMA_STATS'] = '1'
 
-argv = [str(root / 'build-clang/shadps4.exe'), str(root),
-        '-g', 'E:/Games/emulators/ps4/roms/CUSA49696/eboot.bin', '-f', 'false',
-        '--show-fps']
+argv = paths.ARGV + ['--show-fps']
 proc = subprocess.Popen(argv, cwd=str(root), env=env)
 
 windows = []
@@ -58,8 +56,6 @@ while time.time() < deadline:
             break
     if hwnd:
         break
-argv = paths.ARGV + ['--show-fps']
-proc = subprocess.Popen(argv, cwd=str(root), env=env)
 
 if not hwnd:
     print('no SDL window found; windows:', [(hex(h), c) for h, c in windows])

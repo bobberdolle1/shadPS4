@@ -13,6 +13,7 @@ Unreleased
 - video_core: Use the surface width as the pitch for thin tile modes, which ignore the T# pitch field.
 - video_core: Handle the ArrayLinearGeneral array mode instead of aborting on it.
 - video_core: Treat an undecodable or truncated PM4 word as end-of-stream instead of aborting.
+- video_core: Sync only the ranges the CPU wrote since the previous DMA draw, instead of walking every mapped range on every draw.
 
 v0.4.0 31/10/2024 - codename divicius
 =================

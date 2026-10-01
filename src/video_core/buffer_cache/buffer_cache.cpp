@@ -281,11 +281,12 @@ bool BufferCache::DownloadImage(Image& image) {
     return false;
 }
 
-// Incremental DMA sync. GT_DMA_DIRTY=1 restricts each draw's upload to the ranges the CPU
-// actually wrote since the previous draw, instead of walking every mapped range.
+// Incremental DMA sync. Each draw uploads only the ranges the CPU wrote since the previous
+// draw instead of walking every mapped range. Measured 16-17 -> 21-22 FPS in a race.
 bool DmaDirtyEnabled() {
-    static const bool enabled = std::getenv("GT_DMA_DIRTY") != nullptr;
-    return enabled;
+    // On by default; set GT_DMA_DIRTY=0 to restore the full scan.
+    static const char* v = std::getenv("GT_DMA_DIRTY");
+    return v == nullptr || std::string_view{v} != "0";
 }
 
 void BufferCache::LogDmaDirty(VAddr address, u64 size) {
