@@ -177,6 +177,25 @@ void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
     }
 }
 
+void TextureCache::PrepareCpuVolatileRange(VAddr address, u64 size) {
+    std::scoped_lock lock{mutex};
+    ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
+        // GpuDirty means a buffer owns the newer data, not this image.
+        if (True(image.flags & ImageFlagBits::GpuModified) &&
+            False(image.flags & ImageFlagBits::GpuDirty)) {
+            // Explicit CPU invalidations must be reconciled before GPU pixels are
+            // downloaded, or the download would overwrite those guest writes.
+            RefreshImage(image);
+            if (True(image.flags & ImageFlagBits::Dirty) || !buffer_cache.DownloadImage(image)) {
+                return;
+            }
+        }
+        image.flags &= ~ImageFlagBits::GpuModified;
+        image.flags |= ImageFlagBits::CpuDirty;
+        UntrackImage(image_id);
+    });
+}
+
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, BindingType binding,
                                           ImageId cache_image_id) {
     auto& cache_image = slot_images[cache_image_id];
@@ -282,17 +301,24 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
-        const bool pow2_padding_only =
-            image_info.props.is_pow2 != cache_image.info.props.is_pow2 &&
+        // A single 2D subresource can have extra allocation padding in CB_SLICE without
+        // changing its visible pixels. Mip chains and arrays still need matching strides.
+        const bool allocation_padding_only =
+            image_info.type == AmdGpu::ImageType::Color2D &&
+            image_info.type == cache_image.info.type &&
             image_info.tile_mode == cache_image.info.tile_mode &&
             image_info.size == cache_image.info.size &&
-            image_info.pitch == cache_image.info.pitch && image_info.resources.levels == 1 &&
-            cache_image.info.resources.levels == 1 && image_info.resources.layers == 1 &&
-            cache_image.info.resources.layers == 1;
+            image_info.pitch == cache_image.info.pitch &&
+            image_info.num_bits == cache_image.info.num_bits &&
+            image_info.num_samples == cache_image.info.num_samples &&
+            image_info.bank_swizzle == cache_image.info.bank_swizzle &&
+            image_info.alt_tile == cache_image.info.alt_tile &&
+            image_info.resources.levels == 1 && cache_image.info.resources.levels == 1 &&
+            image_info.resources.layers == 1 && cache_image.info.resources.layers == 1;
 
         // Size and resources are less than or equal, use image view.
         if (image_info.pixel_format != cache_image.info.pixel_format ||
-            image_info.guest_size <= cache_image.info.guest_size || pow2_padding_only) {
+            image_info.guest_size <= cache_image.info.guest_size || allocation_padding_only) {
             auto result_id = merged_image_id ? merged_image_id : cache_image_id;
             const auto& result_image = slot_images[result_id];
             const bool is_compatible =
@@ -612,6 +638,7 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
 
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
+    UpdateImage(image_id);
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
@@ -620,19 +647,18 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
             download_images.emplace(image_id);
         }
     }
-    UpdateImage(image_id);
     return image.FindView(desc.view_info);
 }
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
-    image.flags |= ImageFlagBits::GpuModified;
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
     }
     image.usage.render_target = 1u;
     UpdateImage(image_id);
+    image.flags |= ImageFlagBits::GpuModified;
 
     // Register meta data for this color buffer
     if (desc.info.meta_info.cmask_addr) {
@@ -652,9 +678,9 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
-    image.flags |= ImageFlagBits::GpuModified;
     image.usage.depth_target = 1u;
     UpdateImage(image_id);
+    image.flags |= ImageFlagBits::GpuModified;
 
     // Register meta data for this depth buffer
     if (desc.info.meta_info.htile_addr) {
@@ -690,6 +716,16 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 }
 
 void TextureCache::RefreshImage(Image& image) {
+    const bool cpu_volatile =
+        buffer_cache.IsRegionCpuVolatile(image.info.guest_address, image.info.guest_size);
+    if (cpu_volatile &&
+        (False(image.flags & ImageFlagBits::GpuModified) ||
+         True(image.flags & ImageFlagBits::GpuDirty))) {
+        // Pinned CPU-owned pages need revalidation on every consumption. Do not
+        // invent a CPU invalidation for GPU-owned pixels, but retain real dirty
+        // flags so the normal per-mip hash reconciliation still runs.
+        image.flags |= ImageFlagBits::CpuDirty;
+    }
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }

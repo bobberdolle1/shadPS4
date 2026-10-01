@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <deque>
 #include <vector>
 
@@ -37,6 +38,24 @@ public:
         });
     }
 
+    bool IsRegionCpuVolatile(VAddr cpu_addr, u64 size) noexcept {
+        return IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            return manager->IsRegionCpuVolatile(offset, size);
+        });
+    }
+
+    void RefreshCpuVolatile(VAddr cpu_addr, u64 size) {
+        IteratePages<true>(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            manager->RefreshCpuVolatile(offset, size);
+        });
+    }
+
+    void MarkRegionAsGpuModified(VAddr cpu_addr, u64 size) {
+        IteratePages<true>(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            manager->template ChangeRegionState<StateOp::Clear, StateOp::Set>(offset, size);
+        });
+    }
+
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr cpu_addr, u64 size, bool is_write) noexcept {
         IteratePages(cpu_addr, size, [is_write](RegionManager* manager, u64 offset, u64 size) {
@@ -64,7 +83,8 @@ public:
         IteratePages(cpu_addr, size, [&should_flush](RegionManager* manager, u64 offset, u64 size) {
             const auto bounds = manager->GetBounds(offset, size);
             manager->Lock(bounds);
-            const bool modified = manager->template IsRegionModified<Type::GPU>(offset, size);
+            const bool modified =
+                manager->template IsRegionModified<Type::GPU, false>(offset, size);
             if (!modified) {
                 manager->template ChangeRegionState<StateOp::Set, StateOp::None, false>(offset,
                                                                                         size);
@@ -107,12 +127,15 @@ private:
     bool IteratePages(VAddr cpu_address, u64 size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, RegionManager*, u64, size_t>::type;
         static constexpr bool BOOL_BREAK = std::is_same_v<FuncReturn, bool>;
+        if (!PageManager::IsGpuAddressableRange(cpu_address, size)) {
+            return false;
+        }
         u64 remaining_size = size;
         u64 page_index = cpu_address >> HIGHER_PAGE_BITS;
         u64 page_offset = cpu_address & HIGHER_PAGE_MASK;
         while (remaining_size > 0) {
             const u64 copy_amount = std::min(HIGHER_PAGE_SIZE - page_offset, remaining_size);
-            if (auto* region = top_tier[page_index]; region) {
+            if (auto* region = top_tier[page_index].load(std::memory_order_acquire); region) {
                 if constexpr (BOOL_BREAK) {
                     if (func(region, page_offset, copy_amount)) {
                         return true;
@@ -150,7 +173,7 @@ private:
         auto* new_manager = free_managers.back();
         new_manager->SetCpuAddress(base_cpu_addr);
         free_managers.pop_back();
-        top_tier[page_index] = new_manager;
+        top_tier[page_index].store(new_manager, std::memory_order_release);
         return new_manager;
     }
 
@@ -158,7 +181,7 @@ private:
     const u32 readbacks_mode;
     std::deque<std::array<RegionManager, MANAGER_POOL_SIZE>> manager_pool;
     std::vector<RegionManager*> free_managers;
-    std::array<RegionManager*, NUM_HIGH_PAGES> top_tier{};
+    std::array<std::atomic<RegionManager*>, NUM_HIGH_PAGES> top_tier{};
 };
 
 } // namespace VideoCore

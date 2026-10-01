@@ -85,6 +85,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     bda_pagetable_buffer = std::make_unique<Buffer>(
         instance, 0, bda_pagetable_size, MemoryType::DeviceLocal, "BDA Page Table Buffer");
     runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
+    const auto* fault_buffer = fault_manager->GetFaultBuffer();
+    runtime.FillBuffer(fault_buffer, 0u, fault_buffer->SizeBytes(), 0u);
 }
 
 BufferCache::~BufferCache() = default;
@@ -209,13 +211,80 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionGpuModified(addr, size);
 }
 
+void BufferCache::RefreshCpuVolatile(VAddr address, u64 size) {
+    memory_tracker->RefreshCpuVolatile(address, size);
+}
+
+void BufferCache::MarkCpuModified(VAddr address, u64 size) {
+    memory_tracker->MarkRegionAsCpuModified(address, size);
+}
+
+bool BufferCache::IsRegionCpuVolatile(VAddr address, u64 size) {
+    return memory_tracker->IsRegionCpuVolatile(address, size);
+}
+
+bool BufferCache::DownloadImage(Image& image) {
+    const VAddr address = image.info.guest_address;
+    const u64 size = image.info.guest_size;
+    const u64 first_block = address >> block_shift;
+    const u64 last_block = (address + size - 1) >> block_shift;
+    const auto* arena = GetArena(first_block, last_block);
+    EnsureResident(arena, first_block, last_block);
+    // Preserve padding and untouched bytes before image subresources overwrite the arena.
+    SynchronizeMemory(arena, address, static_cast<u32>(size), false, false);
+    if (CopyImageToBuffer(arena, image)) {
+        memory_tracker->MarkRegionAsGpuModified(address, size);
+        gpu_modified_ranges.Add(address, size);
+        DownloadMemory(arena, address, size);
+        return true;
+    }
+    return false;
+}
+
 void BufferCache::SynchronizeDmaBuffers() {
+    // Dynamic addresses cannot be flattened on the CPU. Populate committed GPU backing
+    // before their first shader read; sparse PRT reservations have no data to upload.
+    memory->GetGpuReadableMemoryRanges(dma_backing_ranges);
+    for (const auto& [address, size] : dma_backing_ranges) {
+        u64 first_block = address >> block_shift;
+        const u64 end_block = Common::AlignUp(size + address, u64{block_size}) >> block_shift;
+        while (first_block < end_block) {
+            const u64 arena_end =
+                Common::AlignDownPow2(first_block, u64{blocks_per_arena_page}) +
+                blocks_per_arena_page;
+            const u64 last_block = std::min(end_block, arena_end) - 1;
+            EnsureResident(GetArena(first_block, last_block), first_block, last_block);
+            first_block = last_block + 1;
+        }
+    }
+
     fault_process_pending = true;
+    constexpr u64 max_upload = std::numeric_limits<u32>::max();
+    for (const auto& [base, size_bytes] : dma_backing_ranges) {
+        VAddr address = base;
+        const VAddr end = base + size_bytes;
+        while (address < end) {
+            const auto* arena = address_space[address >> ARENA_PAGE_BITS];
+            const u64 size = std::min({end - address, max_upload,
+                                      arena->cpu_addr + arena->size_bytes - address});
+            SynchronizeMemory(arena, address, static_cast<u32>(size), false, false);
+            address += size;
+        }
+    }
+    if (runtime.HasPendingBufferWrites()) {
+        runtime.FlushBarriers();
+    }
+}
+
+void BufferCache::RegisterDmaReads(vk::PipelineStageFlags2 stage) {
+    runtime.AccessBuffer(bda_pagetable_buffer.get(), 0, bda_pagetable_buffer->SizeBytes(), stage,
+                         vk::AccessFlagBits2::eShaderRead);
     for (const auto& range : resident_ranges) {
-        const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
-        const VAddr device_addr = range.start << block_shift;
-        const u64 size = (range.end - range.start) << block_shift;
-        SynchronizeMemory(address_space[page], device_addr, size, false, false);
+        const VAddr address = range.start << block_shift;
+        const auto* arena = address_space[address >> ARENA_PAGE_BITS];
+        runtime.AccessBuffer(arena, arena->Offset(address),
+                             (range.end - range.start) << block_shift, stage,
+                             vk::AccessFlagBits2::eShaderRead);
     }
 }
 
@@ -286,7 +355,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     }
 
     const vk::MemoryAllocateInfo alloc_info = {
-        .allocationSize = resident_blocks << block_shift,
+        .allocationSize = u64{resident_blocks} << block_shift,
         .memoryTypeIndex = arena_memory_type_index,
     };
     const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
@@ -317,7 +386,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         });
         memory_offset += bind.size;
 
-        for (u32 block = 0; block < bind.size; block += block_size) {
+        for (u64 block = 0; block < bind.size; block += block_size) {
             *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;
         }
         const u64 copy_size = (backing.end - backing.start) * sizeof(vk::DeviceAddress);
@@ -371,7 +440,11 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
     ASSERT_MSG(device_addr == image.info.guest_address,
                "Texel buffer aliases image subresources {:x} : {:x}", device_addr,
                image.info.guest_address);
-    const u64 arena_offset = arena->Offset(device_addr);
+    return CopyImageToBuffer(arena, image);
+}
+
+bool BufferCache::CopyImageToBuffer(const Buffer* arena, Image& image) {
+    const u64 arena_offset = arena->Offset(image.info.guest_address);
     boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
     for (u32 mip = 0; mip < image.info.resources.levels; mip++) {
         const auto& mip_info = image.info.mips_layout[mip];

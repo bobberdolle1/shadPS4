@@ -3,6 +3,17 @@ SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
+Unreleased
+==========
+
+- core/memory: Restrict direct-memory unmaps to the physical range being released.
+- video_core: Preserve guest allocation padding when tiling image data back to memory.
+- video_core: Preserve ASC packet boundaries across ring fragments and indirect buffers; consume type-2 padding as one dword.
+
+- video_core: Use the surface width as the pitch for thin tile modes, which ignore the T# pitch field.
+- video_core: Handle the ArrayLinearGeneral array mode instead of aborting on it.
+- video_core: Treat an undecodable or truncated PM4 word as end-of-stream instead of aborting.
+
 v0.4.0 31/10/2024 - codename divicius
 =================
 

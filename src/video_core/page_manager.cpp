@@ -41,6 +41,7 @@ struct PageManager::Impl {
     struct PageState {
         u8 num_write_watchers;
         u8 num_read_watchers;
+        u32 cpu_volatile_refs;
 
         Core::MemoryPermission WritePerm() const noexcept {
             return num_write_watchers == 0 ? Core::MemoryPermission::Write
@@ -53,6 +54,9 @@ struct PageManager::Impl {
         }
 
         Core::MemoryPermission Perms() const noexcept {
+            if (cpu_volatile_refs != 0) {
+                return Core::MemoryPermission::Read | Core::MemoryPermission::Write;
+            }
             return ReadPerm() | WritePerm();
         }
 
@@ -88,7 +92,7 @@ struct PageManager::Impl {
         }
     };
 
-    static constexpr size_t ADDRESS_BITS = 40;
+    static constexpr size_t ADDRESS_BITS = PageManager::ADDRESS_BITS;
     static constexpr size_t NUM_ADDRESS_PAGES = 1ULL << (40 - PM_PAGE_BITS);
     static constexpr size_t NUM_ADDRESS_LOCKS = NUM_ADDRESS_PAGES / NUM_REGION_PAGES;
     inline static Vulkan::Rasterizer* rasterizer;
@@ -113,6 +117,38 @@ struct PageManager::Impl {
         const size_t end_page = end >> PM_PAGE_BITS;
         cached_pages.reserve(start_page, end_page);
         locks.reserve(start_page, end_page);
+    }
+
+    void UpdateCpuVolatileRange(VAddr address, u64 size, bool add) {
+        const VAddr begin = GetPageAddr(address);
+        const VAddr end = GetNextPageAddr(address + size - 1);
+        EnsurePages(begin, end);
+        for (VAddr page = begin; page < end; page += PM_PAGE_SIZE) {
+            const u64 index = page >> PM_PAGE_BITS;
+            std::scoped_lock lock{locks[index]};
+            auto& state = cached_pages[index];
+            const auto old_perms = state.Perms();
+            if (add) {
+                ++state.cpu_volatile_refs;
+            } else {
+                ASSERT(state.cpu_volatile_refs != 0);
+                --state.cpu_volatile_refs;
+            }
+            const auto new_perms = state.Perms();
+            if (old_perms != new_perms) {
+                Protect(page, PM_PAGE_SIZE, new_perms);
+            }
+        }
+    }
+
+    bool IsCpuVolatile(VAddr address) {
+        const u64 index = address >> PM_PAGE_BITS;
+        auto* state = cached_pages.find(index);
+        if (!state) {
+            return false;
+        }
+        std::scoped_lock lock{locks[index]};
+        return state->cpu_volatile_refs != 0;
     }
 
     void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) {
@@ -160,6 +196,7 @@ struct PageManager::Impl {
         for (u64 page = page_start; page != page_end; ++page) {
             PageState* state = cached_pages.find(page);
             if (!state) {
+                release_pending();
                 continue;
             }
 
@@ -225,6 +262,7 @@ struct PageManager::Impl {
         for (u64 page = page_start; page != page_end; ++page) {
             PageState* state = cached_pages.find(base_page + page);
             if (!state) {
+                release_pending();
                 continue;
             }
 
@@ -495,6 +533,16 @@ void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bou
                                               const RegionBits& read_mask, PageOp write_op,
                                               PageOp read_op) const {
     impl->UpdatePageWatchersForRegion(base_addr, bounds, write_mask, read_mask, write_op, read_op);
+}
+
+void PageManager::UpdateCpuVolatileRange(VAddr address, u64 size, bool add) {
+    if (IsGpuAddressableRange(address, size)) {
+        impl->UpdateCpuVolatileRange(address, size, add);
+    }
+}
+
+bool PageManager::IsCpuVolatile(VAddr address) const {
+    return address < ADDRESS_SPACE_SIZE && impl->IsCpuVolatile(address);
 }
 
 } // namespace VideoCore

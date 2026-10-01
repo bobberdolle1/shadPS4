@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/div_ceil.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -33,6 +34,7 @@ struct TilingInfo {
     u32 num_slices;
     u32 num_mips;
     std::array<ImageInfo::MipInfo, 16> mips;
+    std::array<vk::Extent3D, 16> copied_extents{};
 };
 
 TileManager::TileManager(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
@@ -307,9 +309,15 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     for (u32 mip = 0; mip < params.num_mips; ++mip) {
         auto& mip_info = params.mips[mip];
         mip_info = info.mips_layout[mip];
+        const auto& copy = buffer_copies[mip];
+        auto& extent = params.copied_extents[mip];
+        extent = copy.imageExtent;
+        extent.depth *= copy.imageSubresource.layerCount;
         if (info.props.is_block) {
             mip_info.pitch = std::max((mip_info.pitch + 3) / 4, 1U);
             mip_info.height = std::max((mip_info.height + 3) / 4, 1U);
+            extent.width = Common::DivCeil(extent.width, 4u);
+            extent.height = Common::DivCeil(extent.height, 4u);
         }
     }
 
@@ -371,7 +379,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     }};
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
-    const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
+    const auto dim_x = Common::DivCeil(info.guest_size / (info.num_bits / 8), 64u);
     cmdbuf.dispatch(dim_x, 1, 1);
 
     runtime.AccessBuffer(out_buffer, out_offset, info.guest_size,

@@ -875,63 +875,85 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
     auto base_addr = reinterpret_cast<VAddr>(acb.data());
     size_t acb_size = acb.size_bytes();
+    // Diagnostic CPU-backing snapshot: no GPU acquisition or command-byte mutation.
+    std::array<u32, 1024> entry_words;
+    const u32 entry_count = static_cast<u32>(std::min(acb.size(), entry_words.size()));
+    Core::Memory::Instance()->CopySparseMemory(
+        base_addr, reinterpret_cast<u8*>(entry_words.data()), entry_count * sizeof(u32));
+    struct PacketTrace {
+        u32 offset;
+        u32 raw;
+        u32 words;
+        u32 consumed;
+        u32 pending;
+    };
+    std::array<PacketTrace, 8> packet_history;
+    u32 packet_sequence = 0;
     while (!acb.empty()) {
         ProcessCommands();
-
-        auto* header = reinterpret_cast<const PM4Header*>(acb.data());
-        u32 next_dw_off = header->type3.NumWords() + 1;
-
-        // If we have a buffered packet, use it.
-        if (queue.tmp_dwords > 0) [[unlikely]] {
-            header = reinterpret_cast<const PM4Header*>(queue.tmp_packet.data());
-            next_dw_off = header->type3.NumWords() + 1 - queue.tmp_dwords;
-            std::memcpy(queue.tmp_packet.data() + queue.tmp_dwords, acb.data(),
-                        next_dw_off * sizeof(u32));
-            queue.tmp_dwords = 0;
+        const u32 source_offset =
+            static_cast<u32>((reinterpret_cast<VAddr>(acb.data()) - base_addr) / sizeof(u32));
+        const u32 pending = queue.packet_framer.PendingDwords();
+        if ((is_indirect || pending == 0) && (acb.front() >> 30) != 2 &&
+            (acb.front() >> 30) != 3) {
+            LOG_CRITICAL(Render_Vulkan,
+                         "PM4 first invalid header: vqid={} indirect={} base={:#x} "
+                         "stream_dw={} offset={} remaining={} raw={:#x} entry_available={} "
+                         "entry_raw={:#x} ring={:#x} read={} pending={}",
+                         vqid, is_indirect, base_addr, acb_size / sizeof(u32), source_offset,
+                         acb.size(), acb.front(), source_offset < entry_count,
+                         source_offset < entry_count ? entry_words[source_offset] : 0,
+                         queue.map_addr, *queue.read_addr, pending);
+            Libraries::GnmDriver::LogComputeWaitProvenance(base_addr, acb_size);
+            const u32 first = packet_sequence > packet_history.size()
+                                  ? packet_sequence - static_cast<u32>(packet_history.size())
+                                  : 0;
+            for (u32 seq = first; seq < packet_sequence; ++seq) {
+                const auto& trace = packet_history[seq % packet_history.size()];
+                LOG_CRITICAL(Render_Vulkan,
+                             "PM4 preceding packet: seq={} offset={} raw={:#x} "
+                             "packet_dw={} consumed={} pending_before={}",
+                             seq, trace.offset, trace.raw, trace.words, trace.consumed,
+                             trace.pending);
+            }
+            for (u32 dw = 0; dw < entry_count; ++dw) {
+                LOG_CRITICAL(Render_Vulkan, "PM4 entry word: offset={} raw={:#010x}", dw,
+                             entry_words[dw]);
+            }
+            for (u32 dw = 0; dw < std::min<size_t>(acb.size(), 32); ++dw) {
+                LOG_CRITICAL(Render_Vulkan, "PM4 current word: offset={} raw={:#010x}",
+                             source_offset + dw, acb[dw]);
+            }
         }
 
-        // If the packet is split across ring boundary, buffer until next submission
-        if (next_dw_off > acb.size()) [[unlikely]] {
-            std::memcpy(queue.tmp_packet.data(), acb.data(), acb.size_bytes());
-            queue.tmp_dwords = acb.size();
+        const auto packet = [&] {
+            if constexpr (is_indirect) {
+                // An IB is a sealed stream, not another fragment of the queue's ring.
+                return PM4PacketFramer::ReadComplete(acb);
+            } else {
+                return queue.packet_framer.Read(acb);
+            }
+        }();
+        const u32 next_dw_off = packet.consumed_dwords;
+        packet_history[packet_sequence % packet_history.size()] = {
+            source_offset, packet.words.empty() ? acb.front() : packet.words.front(),
+            static_cast<u32>(packet.words.size()), next_dw_off, pending};
+        ++packet_sequence;
+        if (packet.words.empty()) {
             if constexpr (!is_indirect) {
-                *queue.read_addr += acb.size();
+                *queue.read_addr += next_dw_off;
                 *queue.read_addr %= queue.ring_size_dw;
             }
             break;
         }
-
+        const auto* header = reinterpret_cast<const PM4Header*>(packet.words.data());
         if (header->type == 2) {
-            // Type-2 packet are used for padding purposes
-            next_dw_off = 1;
             acb = NextPacket(acb, next_dw_off);
             if constexpr (!is_indirect) {
                 *queue.read_addr += next_dw_off;
                 *queue.read_addr %= queue.ring_size_dw;
             }
             continue;
-        }
-        if (header->type == 0) {
-            const u32 type0_words = header->type0.NumWords();
-            LOG_WARNING(Render_Vulkan,
-                        "ProcessCompute: PM4 Type 0 encountered: raw=0x{:08x} base=0x{:x} count={} acb_size={} is_indirect={}",
-                        header->raw, header->type0.base.Value(), type0_words, acb.size(), is_indirect);
-            for (size_t i = 0; i < std::min<size_t>(acb.size(), 8); ++i) {
-                LOG_WARNING(Render_Vulkan, "  acb[{}] = 0x{:08x}", i, acb[i]);
-            }
-            const u32 skip_dwords = (header->raw == 0) ? 1 : (type0_words + 1);
-            next_dw_off = std::min<u32>(skip_dwords, static_cast<u32>(acb.size()));
-            acb = NextPacket(acb, next_dw_off);
-            if constexpr (!is_indirect) {
-                *queue.read_addr += next_dw_off;
-                *queue.read_addr %= queue.ring_size_dw;
-            }
-            continue;
-        }
-
-        if (header->type != 3) {
-            // No other types of packets were spotted so far
-            UNREACHABLE_MSG("Invalid PM4 type {}", header->type.Value());
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
@@ -952,6 +974,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
             }
+            task.handle.destroy();
             break;
         }
         case PM4ItOpcode::DmaData: {
@@ -1132,22 +1155,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             // const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
             break;
         }
-        default: {
-            // GT7 can expose not-yet-written async-compute ring data as an unknown packet.
-            // The reference fork observed this exact opcode/count pair in run 128; aborting
-            // the emulator loses the session, while advancing by the declared packet size
-            // contains the bad ring word.
-            static u32 unknown_pm4_logged = 0;
-            if (unknown_pm4_logged < 16) {
-                ++unknown_pm4_logged;
-                LOG_CRITICAL(Lib_GnmDriver,
-                             "Unknown ACB PM4 type 3 opcode {:#x} with count {} - skipping the "
-                             "packet ({} so far)",
-                             static_cast<u32>(opcode), header->type3.NumWords(),
-                             unknown_pm4_logged);
-            }
-            break;
-        }
+        default:
+            UNREACHABLE_MSG("Unknown ACB PM4 type 3 opcode {:#x} with count {}",
+                            static_cast<u32>(opcode), header->type3.NumWords());
 
         }
 

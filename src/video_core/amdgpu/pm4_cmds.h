@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <cstring>
+#include <span>
 #include "common/assert.h"
 #include "common/bit_field.h"
 #include "common/types.h"
@@ -66,6 +69,109 @@ union PM4Header {
     PM4Type0Header type0;
     PM4Type3Header type3;
     BitField<30, 2, u32> type;
+};
+
+class PM4PacketFramer {
+public:
+    static constexpr u32 MaxPacketDwords = 0x4000;
+
+    struct Packet {
+        std::span<const u32> words;
+        u32 consumed_dwords;
+    };
+
+    // Only the used prefix is initialized; a queue need not clear 64 KiB on creation.
+    PM4PacketFramer() : pending_dwords{0} {}
+
+    [[nodiscard]] u32 PendingDwords() const noexcept {
+        return pending_dwords;
+    }
+
+    /// Returns the packet length in dwords, or 0 when the word is not a packet header.
+    /// Hardware never traps on an undecodable word: it simply stops fetching. Mirroring
+    /// that keeps a malformed guest stream from aborting the whole emulator.
+    static u32 TryPacketDwords(u32 raw_header) noexcept {
+        const PM4Header header{.raw = raw_header};
+        if (header.type == 2) {
+            return 1;
+        }
+        if (header.type != 3) {
+            return 0;
+        }
+        return header.type3.NumWords() + 1;
+    }
+
+    static u32 PacketDwords(u32 raw_header) {
+        const u32 total = TryPacketDwords(raw_header);
+        ASSERT_MSG(total != 0, "Invalid PM4 header {:#x}", raw_header);
+        return total;
+    }
+
+    static void LogStreamEnd(u32 raw_header, u32 total, u32 available) {
+        static u32 stream_end_logged = 0;
+        if (stream_end_logged < 8) {
+            ++stream_end_logged;
+            LOG_WARNING(Render_Vulkan,
+                        "PM4 stream ends at undecodable word {:#x} (packet needs {} dwords, "
+                        "{} available); dropping the rest of this stream",
+                        raw_header, total, available);
+        }
+    }
+
+    /// Reads a sealed stream: the whole packet must already be present.
+    static Packet ReadComplete(std::span<const u32> input) {
+        ASSERT(!input.empty());
+        const u32 total = TryPacketDwords(input.front());
+        if (total == 0 || total > input.size()) {
+            LogStreamEnd(input.front(), total, static_cast<u32>(input.size()));
+            return {std::span<const u32>{}, static_cast<u32>(input.size())};
+        }
+        return {input.first(total), total};
+    }
+
+    /// Reads from a queue ring that may hand out only a fragment of a packet.
+    Packet Read(std::span<const u32> input) {
+        ASSERT(!input.empty());
+        if (pending_dwords != 0) {
+            const u32 total = PacketDwords(pending_packet[0]);
+            ASSERT(pending_dwords < total);
+            const u32 appended = static_cast<u32>(
+                std::min<size_t>(input.size(), total - pending_dwords));
+            std::memcpy(pending_packet.data() + pending_dwords, input.data(),
+                        appended * sizeof(u32));
+            pending_dwords += appended;
+            if (pending_dwords != total) {
+                return {std::span<const u32>{}, appended};
+            }
+            // The caller advances its read cursor by consumed_dwords, which must count only
+            // the words taken from this fragment, not the whole packet.
+            const Packet packet{std::span<const u32>{pending_packet.data(), total}, appended};
+            pending_dwords = 0;
+            return packet;
+        }
+
+        const u32 total = TryPacketDwords(input.front());
+        if (total == 0) {
+            LogStreamEnd(input.front(), total, static_cast<u32>(input.size()));
+            return {std::span<const u32>{}, static_cast<u32>(input.size())};
+        }
+        if (total <= input.size()) {
+            return {input.first(total), total};
+        }
+
+        // Packet straddles the end of this fragment; stash it for the next one.
+        if (total > MaxPacketDwords) {
+            LogStreamEnd(input.front(), total, static_cast<u32>(input.size()));
+            return {std::span<const u32>{}, static_cast<u32>(input.size())};
+        }
+        std::memcpy(pending_packet.data(), input.data(), input.size() * sizeof(u32));
+        pending_dwords = static_cast<u32>(input.size());
+        return {std::span<const u32>{}, pending_dwords};
+    }
+
+private:
+    std::array<u32, MaxPacketDwords> pending_packet{};
+    u32 pending_dwords;
 };
 
 // Write the PM4 header

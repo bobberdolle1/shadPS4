@@ -58,10 +58,7 @@ static void ExitThread() {
     curthread->state = PthreadState::Dead;
     ASSERT(False(curthread->flags & ThreadFlags::NeedSuspend));
 
-    /*
-     * Thread was created with initial refcount 1, we drop the
-     * reference count to allow it to be garbage collected.
-     */
+    /* Drop the running thread's reference; creation may still hold its own reference. */
     curthread->refcount--;
     thread_state->TryCollect(curthread); /* thread lock released */
 
@@ -266,6 +263,12 @@ static void* RunThread(void* arg) {
     UnblockPthreadCancelSignal();
 #endif
 
+    if (True(curthread->attr.flags & PthreadAttrFlags::StackUser)) {
+        Core::Memory::Instance()->PrepareCpuVolatileRange(
+            reinterpret_cast<VAddr>(curthread->attr.stackaddr_attr),
+            curthread->attr.stacksize_attr);
+    }
+
     /* Run the current thread's start routine with argument: */
     auto* const stack =
         (void*)(((size_t)curthread->attr.stackaddr_attr + curthread->attr.stacksize_attr) & (~15));
@@ -338,6 +341,13 @@ int PS4_SYSV_ABI posix_pthread_create_name_np(PthreadT* thread, const PthreadAtt
     } else {
         new_thread->name = fmt::format("Thread{}", new_thread->tid.load());
     }
+    const bool user_stack = True(new_thread->attr.flags & PthreadAttrFlags::StackUser);
+    // Reusing a thread object replaces its previous stack owner, including non-user stacks.
+    // The collector releases supplied-stack ownership only after native completion.
+    memory->SetCpuVolatileRange(
+        reinterpret_cast<VAddr>(new_thread),
+        user_stack ? reinterpret_cast<VAddr>(new_thread->attr.stackaddr_attr) : 0,
+        user_stack ? new_thread->attr.stacksize_attr : 0);
 
     ASSERT(new_thread->attr.suspend == 0);
     new_thread->state = PthreadState::Running;
@@ -346,16 +356,19 @@ int PS4_SYSV_ABI posix_pthread_create_name_np(PthreadT* thread, const PthreadAtt
         new_thread->flags |= ThreadFlags::Detached;
     }
 
-    /* Add the new thread. */
-    new_thread->refcount = 1;
+    /* Keep a creator reference until completion ownership and affinity are published. */
+    new_thread->refcount = 2;
+    new_thread->native_thr = std::make_unique<Core::NativeThread>();
     thread_state->Link(curthread, new_thread);
 
     /* Return thread pointer eariler so that new thread can use it. */
     (*thread) = new_thread;
 
     /* Create thread */
-    new_thread->native_thr = std::make_unique<Core::NativeThread>(Core::NativeThread());
     int ret = new_thread->native_thr->Create(RunThread, new_thread);
+    if (ret) {
+        memory->SetCpuVolatileRange(reinterpret_cast<VAddr>(new_thread), 0, 0);
+    }
 
     ASSERT_MSG(ret == 0, "Failed to create thread with error {}", ret);
 
@@ -365,6 +378,7 @@ int PS4_SYSV_ABI posix_pthread_create_name_np(PthreadT* thread, const PthreadAtt
     if (ret) {
         *thread = nullptr;
     }
+    thread_state->RefDelete(new_thread);
     return ret;
 }
 

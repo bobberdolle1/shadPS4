@@ -7,6 +7,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 #include "common/enum.h"
 #include "common/shared_first_mutex.h"
 #include "common/singleton.h"
@@ -253,6 +254,7 @@ public:
     void SetPrtArea(u32 id, VAddr address, u64 size);
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
+    void GetGpuReadableMemoryRanges(std::vector<std::pair<VAddr, u64>>& ranges);
 
     bool TryWriteBacking(void* address, const void* data, u64 size);
 
@@ -304,6 +306,10 @@ public:
 
     void InvalidateMemory(VAddr addr, u64 size) const;
 
+    void SetCpuVolatileRange(VAddr owner, VAddr address, u64 size);
+
+    void PrepareCpuVolatileRange(VAddr address, u64 size);
+
 private:
     VMAHandle FindVMA(VAddr target) {
         return std::prev(vma_map.upper_bound(target));
@@ -317,7 +323,7 @@ private:
         return std::prev(fmem_map.upper_bound(target));
     }
 
-    bool HasPhysicalBacking(VirtualMemoryArea vma) {
+    bool HasPhysicalBacking(const VirtualMemoryArea& vma) const {
         return vma.type == VMAType::Direct || vma.type == VMAType::Flexible ||
                vma.type == VMAType::Pooled;
     }

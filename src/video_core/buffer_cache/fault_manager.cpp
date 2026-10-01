@@ -96,9 +96,9 @@ void FaultManager::ProcessFaultBuffer() {
 
     const vk::BufferMemoryBarrier2 pre_barrier = {
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
         .buffer = fault_buffer.Handle(),
         .offset = 0,
         .size = fault_buffer_size,
@@ -107,7 +107,7 @@ void FaultManager::ProcessFaultBuffer() {
         .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
         .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
         .buffer = fault_buffer.Handle(),
         .offset = 0,
         .size = fault_buffer_size,
@@ -165,6 +165,8 @@ void FaultManager::ProcessFaultBuffer() {
         fault_ranges.Clear();
         const u64* fault_buf = std::bit_cast<const u64*>(mapped);
         const u32 fault_count = fault_buf[0];
+        ASSERT_MSG(fault_count < MaxPageFaults, "Fault queue count {} exceeds capacity {}",
+                   fault_count, MaxPageFaults - 1);
         for (u32 i = 1; i <= fault_count; ++i) {
             fault_ranges.Add(fault_buf[i], sparse_pagesize);
             LOG_INFO(Render_Vulkan, "Accessed non-GPU cached memory at {:#x}", fault_buf[i]);

@@ -411,7 +411,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     buffer_infos.clear();
     image_infos.clear();
 
-    bool uses_dma = false;
+    dma_bound = false;
 
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
@@ -424,10 +424,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
                           stage->samplers.size());
         BindBuffers(*stage, binding, push_data);
         BindTextures(*stage, binding);
-        uses_dma |= stage->uses_dma;
+        dma_bound |= stage->uses_dma;
     }
 
-    if (uses_dma) {
+    if (dma_bound) {
         buffer_cache.SynchronizeDmaBuffers();
     }
 
@@ -562,6 +562,10 @@ void Rasterizer::ResetBindings(bool is_compute) {
             is_written ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlagBits2::eNone;
         runtime.AccessBuffer(buffer, offset, size, dst_stage,
                              vk::AccessFlagBits2::eShaderRead | write_flag);
+    }
+    if (dma_bound) {
+        buffer_cache.RegisterDmaReads(is_compute ? vk::PipelineStageFlagBits2::eComputeShader
+                                                 : vk::PipelineStageFlagBits2::eAllGraphics);
     }
     bound_images.clear();
     bound_buffers.clear();
@@ -769,6 +773,28 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
         } else {
             const auto vsharp = desc.GetSharp(stage);
+            if (vsharp.base_address == 0x20 && vsharp.GetSize() >= 1_GB) {
+                const auto raw = std::bit_cast<std::array<u32, 4>>(vsharp);
+                const auto& fetch = desc.sharp_fetch;
+                const auto& cs = liverpool->GetCsRegs();
+                LOG_CRITICAL(Render_Vulkan,
+                             "Malformed buffer provenance: stage={:#x} pgm={:#x} binding={} "
+                             "cs={} summary={} mask={:#x} offsets={},{},{},{} "
+                             "raw={:#x},{:#x},{:#x},{:#x} size={} user_regs={}",
+                             stage.pgm_hash, stage.pgm_base, &desc - stage.buffers.data(),
+                             static_cast<const void*>(&cs), static_cast<u32>(fetch.summary),
+                             fetch.load_mask, fetch.offsets[0], fetch.offsets[1], fetch.offsets[2],
+                             fetch.offsets[3], raw[0], raw[1], raw[2], raw[3], vsharp.GetSize(),
+                             static_cast<u32>(cs.settings.num_user_regs));
+                for (u32 dw = 0; dw < cs.user_data.size(); ++dw) {
+                    LOG_CRITICAL(Render_Vulkan, "Malformed buffer live UD[{}]={:#x}", dw,
+                                 cs.user_data[dw]);
+                }
+                for (u32 dw = 0; dw < std::min<size_t>(stage.flattened_ud_buf.size(), 24); ++dw) {
+                    LOG_CRITICAL(Render_Vulkan, "Malformed buffer flat[{}]={:#x}", dw,
+                                 stage.flattened_ud_buf[dw]);
+                }
+            }
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
@@ -950,10 +976,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 
     u32 image_info_idx = first_image_idx;
-    u32 image_binding_idx = 0;
+    u32 image_resource_idx = 0;
     for (u32 array_size : image_descriptor_array_sizes) {
-        const auto& [_, desc] = image_bindings[image_binding_idx];
-        const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+        const bool is_storage = stage.images[image_resource_idx++].is_written;
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified;
@@ -964,7 +989,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         set_write.pImageInfo = &image_infos[image_info_idx];
 
         image_info_idx += array_size;
-        image_binding_idx += array_size;
         binding.unified += array_size;
     }
 
@@ -1250,6 +1274,81 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     return true;
 }
 
+void Rasterizer::AcquireCpuVolatileRange(VAddr address, u64 size) {
+    size = VideoCore::PageManager::ClampGpuRangeSize(address, size);
+    if (size == 0) {
+        return;
+    }
+    const VAddr begin = VideoCore::PageManager::GetPageAddr(address);
+    const VAddr end = VideoCore::PageManager::GetNextPageAddr(address + size - 1);
+    texture_cache.PrepareCpuVolatileRange(begin, end - begin);
+    // A range may cross an arena boundary. ReadMemory widens within a single arena.
+    for (VAddr current = begin; current < end;) {
+        constexpr u64 ArenaSize = u64{1} << 32;
+        const u64 chunk = std::min(end - current, ArenaSize - (current & (ArenaSize - 1)));
+        if (buffer_cache.IsRegionGpuModified(current, chunk)) {
+            buffer_cache.ReadMemory(current, chunk, false, true);
+        }
+        buffer_cache.MarkCpuModified(current, chunk);
+        current += chunk;
+    }
+    texture_cache.InvalidateMemory(begin, end - begin);
+}
+
+void Rasterizer::SetCpuVolatileRange(VAddr owner, VAddr address, u64 size) {
+    const auto update = [this, owner, address, size] {
+        if (auto it = cpu_volatile_ranges.find(owner); it != cpu_volatile_ranges.end()) {
+            const auto old = it->second;
+            AcquireCpuVolatileRange(old.address, old.size);
+            page_manager.UpdateCpuVolatileRange(old.address, old.size, false);
+            buffer_cache.RefreshCpuVolatile(old.address, old.size);
+            cpu_volatile_ranges.erase(it);
+        }
+        const u64 gpu_size = VideoCore::PageManager::ClampGpuRangeSize(address, size);
+        if (gpu_size != 0) {
+            AcquireCpuVolatileRange(address, gpu_size);
+            page_manager.UpdateCpuVolatileRange(address, gpu_size, true);
+            buffer_cache.RefreshCpuVolatile(address, gpu_size);
+            cpu_volatile_ranges.emplace(owner, CpuVolatileRange{address, gpu_size});
+        }
+    };
+    if (std::this_thread::get_id() == GetGpuCommandProcessorThread()) {
+        update();
+    } else {
+        liverpool->SendCommand<true>(update);
+    }
+}
+
+void Rasterizer::PrepareCpuVolatileRange(VAddr address, u64 size) {
+    size = VideoCore::PageManager::ClampGpuRangeSize(address, size);
+    if (size == 0) {
+        return;
+    }
+    const auto acquire = [this, address, size] { AcquireCpuVolatileRange(address, size); };
+    if (std::this_thread::get_id() == GetGpuCommandProcessorThread()) {
+        acquire();
+    } else {
+        liverpool->SendCommand<true>(acquire);
+    }
+}
+
+void Rasterizer::RemoveCpuVolatileOwners(VAddr address, u64 size) {
+    for (auto it = cpu_volatile_ranges.begin(); it != cpu_volatile_ranges.end();) {
+        const auto range = it->second;
+        const bool overlaps = size != 0 && (range.address <= address
+                                               ? address - range.address < range.size
+                                               : range.address - address < size);
+        if (overlaps) {
+            AcquireCpuVolatileRange(range.address, range.size);
+            page_manager.UpdateCpuVolatileRange(range.address, range.size, false);
+            buffer_cache.RefreshCpuVolatile(range.address, range.size);
+            it = cpu_volatile_ranges.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 bool Rasterizer::IsMapped(VAddr addr, u64 size) {
     if (size == 0) {
         // There is no memory, so not mapped.
@@ -1276,12 +1375,35 @@ void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
     page_manager.OnGpuMap(addr, size);
 }
 
-void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
-    buffer_cache.InvalidateMemory(addr, size);
-    texture_cache.UnmapMemory(addr, size);
-    {
+void Rasterizer::UnmapMemory(VAddr addr, u64 size, bool retire_cpu_ranges) {
+    const auto unmap = [this, addr, size, retire_cpu_ranges] {
+        if (retire_cpu_ranges) {
+            RemoveCpuVolatileOwners(addr, size);
+        } else {
+            // Aperture retirement keeps CPU owners, but must preserve GPU pixels
+            // before the cache images containing their live stack bytes are evicted.
+            for (const auto& [owner, range] : cpu_volatile_ranges) {
+                const bool overlaps = size != 0 && (range.address <= addr
+                                                       ? addr - range.address < range.size
+                                                       : range.address - addr < size);
+                if (overlaps) {
+                    AcquireCpuVolatileRange(range.address, range.size);
+                }
+            }
+        }
+        const u64 gpu_size = VideoCore::PageManager::ClampGpuRangeSize(addr, size);
+        if (gpu_size == 0) {
+            return;
+        }
+        buffer_cache.InvalidateMemory(addr, gpu_size, true);
+        texture_cache.UnmapMemory(addr, gpu_size);
         std::scoped_lock lock{mapped_ranges_mutex};
-        mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+        mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + gpu_size);
+    };
+    if (std::this_thread::get_id() == GetGpuCommandProcessorThread()) {
+        unmap();
+    } else {
+        liverpool->SendCommand<true>(unmap);
     }
 }
 

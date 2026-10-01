@@ -9,6 +9,7 @@
 #include "core/libraries/kernel/threads/sleepq.h"
 #include "core/libraries/kernel/threads/thread_state.h"
 #include "core/memory.h"
+#include "core/thread.h"
 #include "core/tls.h"
 
 namespace Libraries::Kernel {
@@ -41,12 +42,20 @@ void ThreadState::Collect(Pthread* curthread) {
                 ++it;
                 continue;
             }
-            FreeStack(&td->attr);
             work_list.push_back(td);
             it = gc_list.erase(it);
         }
     }
     for (Pthread* td : work_list) {
+        td->native_thr->WaitForExit();
+        if (True(td->attr.flags & PthreadAttrFlags::StackUser)) {
+            Core::Memory::Instance()->SetCpuVolatileRange(reinterpret_cast<VAddr>(td), 0, 0);
+        }
+        {
+            std::scoped_lock lk{thread_list_lock};
+            FreeStack(&td->attr);
+        }
+        td->native_thr.reset();
         Free(curthread, td);
     }
 }

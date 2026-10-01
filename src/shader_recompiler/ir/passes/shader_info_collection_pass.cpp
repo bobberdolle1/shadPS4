@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "core/emulator_settings.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -178,11 +177,6 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
         for (IR::Inst& inst : block->Instructions()) {
             Visit(info, inst);
         }
-    }
-
-    if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {
-        info.uses_dma = false;
-        info.readconst_types = Info::ReadConstType::None;
     }
 
     if (info.uses_dma) {

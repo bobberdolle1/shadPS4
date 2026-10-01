@@ -37,6 +37,31 @@ public:
         cpu_addr = new_cpu_addr;
     }
 
+    void RefreshCpuVolatile(u64 offset, u64 size) {
+        std::scoped_lock lock{mutex};
+        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
+            u64 pins{};
+            IteratePages(mask, [&](u64 first, u64 count) {
+                for (u64 page = first; page < first + count; ++page) {
+                    if (tracker->IsCpuVolatile(cpu_addr +
+                                               (index * PAGES_PER_WORD + page) * BYTES_PER_PAGE)) {
+                        pins |= u64{1} << page;
+                    }
+                }
+            });
+            cpu_volatile[index] = (cpu_volatile[index] & ~mask) | pins;
+        });
+    }
+
+    bool IsRegionCpuVolatile(u64 offset, u64 size) {
+        std::scoped_lock lock{mutex};
+        bool found = false;
+        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
+            found |= (cpu_volatile[index] & cpu[index] & ~gpu[index] & mask) != 0;
+        });
+        return found;
+    }
+
     static constexpr Bounds GetBounds(u64 offset, u64 size) {
         const u64 end_address = offset + size - 1;
         return Bounds{
@@ -119,7 +144,9 @@ public:
         }
         IterateWords(bounds, [&](u64 index, u64 mask) {
             const u64 base_page = index * PAGES_PER_WORD;
-            const u64 word = state[index] & mask;
+            const u64 word =
+                state[index] & mask & (type == Type::CPU ? ~(gpu[index] & cpu_volatile[index])
+                                                        : ~u64{0});
             UpdateStateAndProtection<cpu_op, gpu_op>(write_prot, read_prot, index, mask);
             IteratePages(word, [&](u64 pages_offset, u64 pages_size) {
                 if (end_page == base_page + pages_offset) {
@@ -150,8 +177,12 @@ public:
         }
     }
 
-    template <Type type>
+    template <Type type, bool locked = true>
     bool IsRegionModified(u64 offset, u64 size) noexcept {
+        std::unique_lock lock{mutex, std::defer_lock};
+        if constexpr (locked) {
+            lock.lock();
+        }
         auto& state = GetRegionBits<type>();
         const auto [start_word, start_page, end_word, end_page] = GetBounds(offset, size);
         const auto [start_mask, end_mask] = GetMasks(start_page, end_page);
@@ -185,7 +216,10 @@ private:
         if constexpr (cpu_op != StateOp::None) {
             const u64 prev = cpu[index];
             if constexpr (cpu_op == StateOp::Clear) {
-                cpu[index] &= ~mask;
+                // Read-only uploads cannot observe later untrappable CPU writes.
+                const u64 clear_mask =
+                    gpu_op == StateOp::Set ? mask : (mask & ~cpu_volatile[index]);
+                cpu[index] &= ~clear_mask;
             } else {
                 cpu[index] |= mask;
             }
@@ -271,6 +305,7 @@ private:
     u32 readbacks_mode;
     RegionBits cpu;
     RegionBits gpu;
+    RegionBits cpu_volatile{};
     LockType mutex;
 };
 

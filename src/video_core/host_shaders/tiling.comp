@@ -104,6 +104,7 @@ layout (set = 0, binding = 2, scalar) uniform TilingInfo {
     uint num_slices;
     uint num_mips;
     MipInfo mips[16];
+    uvec3 copied_extents[16];
 } info;
 
 uint32_t ComputePixelIndexWithinMicroTile(uint32_t x, uint32_t y, uint32_t z) {
@@ -414,31 +415,47 @@ uint32_t ComputeSurfaceAddrFromCoordMacroTiled(uint32_t x, uint32_t y, uint32_t 
 #endif
 
 uint GetMipLevel(inout uint texel) {
-    uint mip = 0;
-    uint mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
-    while (texel >= mip_size && mip < info.num_mips) {
+    for (uint mip = 0; mip < info.num_mips; ++mip) {
+        uint mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
+        if (texel < mip_size) {
+            return mip;
+        }
         texel -= mip_size;
-        ++mip;
-        mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
     }
-    return mip;
+    return info.num_mips;
 }
 
 void main() {
     uint texel = gl_GlobalInvocationID.x;
+    if (texel >= uint(linear_data.length())) {
+        return;
+    }
     uint mip = GetMipLevel(texel);
+    if (mip >= info.num_mips) {
+        return;
+    }
     uint pitch = info.mips[mip].pitch;
     uint height = info.mips[mip].height;
     uint tiled_offset = info.mips[mip].offset;
     uint x = texel % pitch;
     uint y = (texel / pitch) % height;
     uint slice = texel / (pitch * height);
+    // Only image-covered texels have initialized linear staging data. Leave
+    // guest pitch, height and slice padding untouched in the tiled backing.
+    if (IS_TILER != 0 &&
+        (x >= info.copied_extents[mip].x || y >= info.copied_extents[mip].y ||
+         slice >= info.copied_extents[mip].z)) {
+        return;
+    }
 
 #if IS_MACRO_TILED
     tiled_offset += ComputeSurfaceAddrFromCoordMacroTiled(x, y, slice, pitch, height, 0);
 #else
     tiled_offset += ComputeSurfaceAddrFromCoordMicroTiled(x, y, slice, pitch, height, 0);
 #endif
+    if (tiled_offset / BYTES_PER_PIXEL >= uint(tiled_data.length())) {
+        return;
+    }
 
     if (IS_TILER != 0) {
         tiled_data[tiled_offset / BYTES_PER_PIXEL] = linear_data[gl_GlobalInvocationID.x];

@@ -76,6 +76,10 @@ public:
 
     void FlushBarriers();
 
+    bool HasPendingBufferWrites() const {
+        return bool(memory_barrier.srcAccessMask);
+    }
+
 private:
     void MakeCurrent(const VideoCore::Buffer* handle);
 

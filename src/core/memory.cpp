@@ -132,7 +132,7 @@ u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
 void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
     PrtArea& area = prt_areas[id];
     if (area.mapped) {
-        rasterizer->UnmapMemory(area.start, area.end - area.start);
+        rasterizer->UnmapMemory(area.start, area.end - area.start, false);
     }
 
     area.start = address;
@@ -158,6 +158,17 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
         size -= copy_size;
         virtual_addr += copy_size;
         dest += copy_size;
+    }
+}
+
+void MemoryManager::GetGpuReadableMemoryRanges(std::vector<std::pair<VAddr, u64>>& ranges) {
+    ranges.clear();
+    std::shared_lock lock{mutex};
+    for (const auto& [address, vma] : vma_map) {
+        if (vma.IsMapped() && HasPhysicalBacking(vma) &&
+            True(vma.prot & MemoryProt::GpuRead) && IsValidGpuMapping(vma.base, vma.size)) {
+            ranges.emplace_back(vma.base, vma.size);
+        }
     }
 }
 
@@ -329,12 +340,13 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
             continue;
         }
         for (auto& [offset_in_vma, phys_mapping] : mapping.phys_areas) {
-            if (phys_addr + size > phys_mapping.base &&
-                phys_addr < phys_mapping.base + phys_mapping.size) {
-                const u64 phys_offset =
-                    std::max<u64>(phys_mapping.base, phys_addr) - phys_mapping.base;
-                const VAddr addr_in_vma = mapping.base + offset_in_vma + phys_offset;
-                const u64 unmap_size = std::min<u64>(phys_mapping.size - phys_offset, size);
+            const PAddr overlap_start = std::max(phys_addr, phys_mapping.base);
+            const PAddr overlap_end =
+                std::min(phys_addr + size, phys_mapping.base + phys_mapping.size);
+            if (overlap_start < overlap_end) {
+                const VAddr addr_in_vma =
+                    mapping.base + offset_in_vma + overlap_start - phys_mapping.base;
+                const u64 unmap_size = overlap_end - overlap_start;
 
                 // Unmapping might erase from vma_map. We can't do it here.
                 remove_list.emplace_back(addr_in_vma, unmap_size);
@@ -344,8 +356,8 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
 
     // Early unmap from GPU to avoid deadlocking.
     for (auto& [addr, unmap_size] : remove_list) {
-        if (IsValidGpuMapping(addr, unmap_size)) {
-            rasterizer->UnmapMemory(addr, unmap_size);
+        if (rasterizer) {
+            rasterizer->UnmapMemory(addr, unmap_size, true);
         }
     }
 
@@ -580,8 +592,8 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
     }
 
     // Perform early GPU unmap to avoid potential deadlocks
-    if (IsValidGpuMapping(virtual_addr, size)) {
-        rasterizer->UnmapMemory(virtual_addr, size);
+    if (rasterizer) {
+        rasterizer->UnmapMemory(virtual_addr, size, true);
     }
 
     // Acquire writer lock.
@@ -769,8 +781,8 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
     }
 
     // Perform early GPU unmap to avoid potential deadlocks
-    if (IsValidGpuMapping(virtual_addr, size)) {
-        rasterizer->UnmapMemory(virtual_addr, size);
+    if (rasterizer) {
+        rasterizer->UnmapMemory(virtual_addr, size, true);
     }
 
     // Aquire writer lock
@@ -837,8 +849,8 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
     }
 
     // Perform early GPU unmap to avoid potential deadlocks
-    if (IsValidGpuMapping(virtual_addr, size)) {
-        rasterizer->UnmapMemory(virtual_addr, size);
+    if (rasterizer) {
+        rasterizer->UnmapMemory(virtual_addr, size, true);
     }
 
     // Aquire writer mutex
@@ -922,9 +934,9 @@ s32 MemoryManager::UnmapMemory(VAddr virtual_addr, u64 size) {
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
-    // If the requested range has GPU access, unmap from GPU.
-    if (IsValidGpuMapping(virtual_addr, size)) {
-        rasterizer->UnmapMemory(virtual_addr, size);
+    // Retire CPU owners before changing VMAs, including mappings crossing the GPU limit.
+    if (rasterizer) {
+        rasterizer->UnmapMemory(virtual_addr, size, true);
     }
 
     // Acquire writer lock.
@@ -1437,6 +1449,19 @@ s32 MemoryManager::GetMemoryPoolStats(::Libraries::Kernel::OrbisKernelMemoryPool
 void MemoryManager::InvalidateMemory(const VAddr addr, const u64 size) const {
     if (rasterizer) {
         rasterizer->InvalidateMemory(addr, size);
+    }
+}
+
+void MemoryManager::SetCpuVolatileRange(VAddr owner, VAddr address, u64 size) {
+    if (rasterizer) {
+        rasterizer->SetCpuVolatileRange(owner, address, size);
+    }
+}
+
+void MemoryManager::PrepareCpuVolatileRange(VAddr address, u64 size) {
+    if (rasterizer && size != 0) {
+        // GPU downloads can consult the VMA map; never hold mutex across this call.
+        rasterizer->PrepareCpuVolatileRange(address, size);
     }
 }
 

@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <mutex>
+
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
@@ -31,6 +34,37 @@ std::unique_ptr<AmdGpu::Liverpool> liverpool;
 namespace Libraries::GnmDriver {
 
 using namespace AmdGpu;
+
+struct ComputeWaitWrite {
+    VAddr address;
+    VAddr caller;
+    u64 sequence;
+    std::array<u32, 14> words;
+};
+static std::mutex compute_wait_mutex;
+static std::array<ComputeWaitWrite, 256> compute_wait_writes;
+static u64 compute_wait_sequence = 0;
+
+void LogComputeWaitProvenance(VAddr begin, u64 size) {
+    std::scoped_lock lock{compute_wait_mutex};
+    const u64 first = compute_wait_sequence > compute_wait_writes.size()
+                          ? compute_wait_sequence - compute_wait_writes.size()
+                          : 0;
+    for (u64 seq = first; seq < compute_wait_sequence; ++seq) {
+        const auto& write = compute_wait_writes[seq % compute_wait_writes.size()];
+        if (write.address < begin + size && write.address + sizeof(write.words) > begin) {
+            LOG_CRITICAL(Lib_GnmDriver,
+                         "ComputeWait producer: seq={} address={:#x} caller={:#x} "
+                         "stream={:#x} offset_bytes={}",
+                         write.sequence, write.address, write.caller, begin,
+                         static_cast<s64>(write.address) - static_cast<s64>(begin));
+            for (u32 dw = 0; dw < write.words.size(); ++dw) {
+                LOG_CRITICAL(Lib_GnmDriver, "ComputeWait emitted word: offset={} raw={:#010x}",
+                             dw, write.words[dw]);
+            }
+        }
+    }
+}
 
 enum GnmEventType : u64 {
     Compute0RelMem = 0x00,
@@ -178,6 +212,7 @@ s32 PS4_SYSV_ABI sceGnmComputeWaitOnAddress(u32* cmdbuf, u32 size, uintptr_t add
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf && (size == 0xe)) {
+        const u32* original = cmdbuf;
         cmdbuf = WriteHeader<PM4ItOpcode::Nop>(cmdbuf, 3);
         cmdbuf = WriteBody(cmdbuf, 0u);
         cmdbuf += 2;
@@ -194,6 +229,14 @@ s32 PS4_SYSV_ABI sceGnmComputeWaitOnAddress(u32* cmdbuf, u32 size, uintptr_t add
         wait_reg_mem->poll_interval = 10u;
 
         WriteTrailingNop<2>(cmdbuf + 7);
+        {
+            std::scoped_lock lock{compute_wait_mutex};
+            auto& write = compute_wait_writes[compute_wait_sequence % compute_wait_writes.size()];
+            write.address = reinterpret_cast<VAddr>(original);
+            write.caller = reinterpret_cast<VAddr>(__builtin_return_address(0));
+            write.sequence = compute_wait_sequence++;
+            std::memcpy(write.words.data(), original, sizeof(write.words));
+        }
         return ORBIS_OK;
     }
     return -1;

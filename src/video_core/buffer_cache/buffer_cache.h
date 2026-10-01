@@ -33,6 +33,7 @@ namespace VideoCore {
 class TextureCache;
 class MemoryTracker;
 class PageManager;
+struct Image;
 
 class BufferCache {
     static constexpr u64 ADDRESS_SPACE_BITS = 40;
@@ -95,8 +96,14 @@ public:
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    void RefreshCpuVolatile(VAddr address, u64 size);
+    void MarkCpuModified(VAddr address, u64 size);
+    bool IsRegionCpuVolatile(VAddr address, u64 size);
+    bool DownloadImage(Image& image);
+
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
+    void RegisterDmaReads(vk::PipelineStageFlags2 stage);
 
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
@@ -125,6 +132,7 @@ private:
                            bool is_texel_buffer);
 
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
+    bool CopyImageToBuffer(const Buffer* arena, Image& image);
 
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
@@ -159,6 +167,7 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    std::vector<std::pair<VAddr, u64>> dma_backing_ranges;
 
     u32 arena_memory_type_index{};
     u32 block_size{};

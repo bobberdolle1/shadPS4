@@ -99,6 +99,8 @@ public:
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
+    void PrepareCpuVolatileRange(VAddr address, u64 size);
+
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
 

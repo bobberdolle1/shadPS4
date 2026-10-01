@@ -6,7 +6,10 @@
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "core/libraries/fiber/fiber_error.h"
+#include "core/libraries/kernel/memory.h"
+#include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/libs.h"
+#include "core/memory.h"
 #include "core/tls.h"
 
 namespace Libraries::Fiber {
@@ -23,6 +26,57 @@ OrbisFiberContext* GetFiberContext() {
     return Core::GetTcbBase()->tcb_fiber;
 }
 
+struct CpuStackRange {
+    VAddr address{};
+    u64 size{};
+};
+
+static CpuStackRange GetThreadContextStack(VAddr stack_pointer) {
+    const auto* thread = Libraries::Kernel::g_curthread;
+    if (thread) {
+        const VAddr stack_base = reinterpret_cast<VAddr>(thread->attr.stackaddr_attr);
+        if (stack_pointer >= stack_base &&
+            stack_pointer - stack_base < thread->attr.stacksize_attr) {
+            return {stack_base, thread->attr.stacksize_attr};
+        }
+        const VAddr alt_stack_base = reinterpret_cast<VAddr>(thread->sigaltstack.ss_sp);
+        if (stack_pointer >= alt_stack_base &&
+            stack_pointer - alt_stack_base < thread->sigaltstack.ss_size) {
+            return {alt_stack_base, thread->sigaltstack.ss_size};
+        }
+    }
+
+    auto* memory = Core::Memory::Instance();
+    Libraries::Kernel::OrbisVirtualQueryInfo info{};
+    if (memory->IsValidMapping(stack_pointer) &&
+        memory->VirtualQuery(stack_pointer, 0, &info) == ORBIS_OK && info.is_committed &&
+        info.start <= stack_pointer && stack_pointer < info.end) {
+        return {info.start, info.end - info.start};
+    }
+    return {};
+}
+
+static void PrepareThreadContextStack(const OrbisFiberContext* ctx) {
+    const auto range = GetThreadContextStack(ctx->rsp);
+    Core::Memory::Instance()->PrepareCpuVolatileRange(range.address, range.size);
+}
+
+static void PrepareFiberContext(const OrbisFiber* fiber) {
+    if (fiber && fiber->addr_context && fiber->size_context != 0) {
+        Core::Memory::Instance()->PrepareCpuVolatileRange(
+            reinterpret_cast<VAddr>(fiber->addr_context), fiber->size_context);
+    } else {
+        if (const auto* ctx = GetFiberContext()) {
+            PrepareThreadContextStack(ctx);
+        }
+    }
+}
+
+static void PrepareCurrentContext() {
+    const auto* ctx = GetFiberContext();
+    PrepareFiberContext(ctx ? ctx->current_fiber : nullptr);
+}
+
 extern "C" s32 PS4_SYSV_ABI _sceFiberSetJmp(OrbisFiberContext* ctx) asm("_sceFiberSetJmp");
 extern "C" s32 PS4_SYSV_ABI _sceFiberLongJmp(OrbisFiberContext* ctx) asm("_sceFiberLongJmp");
 extern "C" void PS4_SYSV_ABI _sceFiberSwitchEntry(OrbisFiberData* data,
@@ -31,6 +85,8 @@ extern "C" void PS4_SYSV_ABI _sceFiberForceQuit(u64 ret) asm("_sceFiberForceQuit
 
 extern "C" void __attribute__((used)) PS4_SYSV_ABI _sceFiberForceQuit(u64 ret) {
     OrbisFiberContext* g_ctx = GetFiberContext();
+    PrepareCurrentContext();
+    PrepareThreadContextStack(g_ctx);
     g_ctx->return_val = ret;
     _sceFiberLongJmp(g_ctx);
 }
@@ -43,7 +99,7 @@ void PS4_SYSV_ABI _sceFiberCheckStackOverflow(OrbisFiberContext* ctx) {
     }
 }
 
-s32 PS4_SYSV_ABI _sceFiberAttachContext(OrbisFiber* fiber, void* addr_context, u64 size_context) {
+static s32 ValidateAttachContext(const OrbisFiber* fiber, void* addr_context, u64 size_context) {
     if (size_context && size_context < ORBIS_FIBER_CONTEXT_MINIMUM_SIZE) {
         return ORBIS_FIBER_ERROR_RANGE;
     }
@@ -56,6 +112,15 @@ s32 PS4_SYSV_ABI _sceFiberAttachContext(OrbisFiber* fiber, void* addr_context, u
     if (fiber->addr_context) {
         return ORBIS_FIBER_ERROR_INVALID;
     }
+    return ORBIS_OK;
+}
+
+static void AttachContext(OrbisFiber* fiber, void* addr_context, u64 size_context) {
+
+    auto* memory = Core::Memory::Instance();
+    memory->SetCpuVolatileRange(reinterpret_cast<VAddr>(fiber),
+                               reinterpret_cast<VAddr>(addr_context), size_context);
+    memory->PrepareCpuVolatileRange(reinterpret_cast<VAddr>(addr_context), size_context);
 
     fiber->addr_context = addr_context;
     fiber->size_context = size_context;
@@ -75,11 +140,11 @@ s32 PS4_SYSV_ABI _sceFiberAttachContext(OrbisFiber* fiber, void* addr_context, u
         }
     }
 
-    return ORBIS_OK;
 }
 
 void PS4_SYSV_ABI _sceFiberSwitchToFiber(OrbisFiber* fiber, u64 arg_on_run_to,
                                          OrbisFiberContext* ctx) {
+    PrepareFiberContext(fiber);
     OrbisFiberContext* fiber_ctx = fiber->context;
     if (fiber_ctx) {
         ctx->arg_on_run_to = arg_on_run_to;
@@ -113,6 +178,7 @@ void PS4_SYSV_ABI _sceFiberSwitchToFiber(OrbisFiber* fiber, u64 arg_on_run_to,
 
 void PS4_SYSV_ABI _sceFiberSwitch(OrbisFiber* cur_fiber, OrbisFiber* fiber, u64 arg_on_run_to,
                                   OrbisFiberContext* ctx) {
+    PrepareThreadContextStack(ctx);
     ctx->prev_fiber = cur_fiber;
     ctx->current_fiber = fiber;
 
@@ -142,6 +208,7 @@ void PS4_SYSV_ABI _sceFiberSwitch(OrbisFiber* cur_fiber, OrbisFiber* fiber, u64 
 }
 
 void PS4_SYSV_ABI _sceFiberTerminate(OrbisFiber* fiber, u64 arg_on_return, OrbisFiberContext* ctx) {
+    PrepareThreadContextStack(ctx);
     ctx->arg_on_return = arg_on_return;
     _sceFiberLongJmp(ctx);
     __builtin_trap();
@@ -175,6 +242,11 @@ s32 PS4_SYSV_ABI sceFiberInitializeImpl(OrbisFiber* fiber, const char* name, Orb
     if (opt_param && opt_param->magic != kFiberOptSignature) {
         return ORBIS_FIBER_ERROR_INVALID;
     }
+
+    auto* memory = Core::Memory::Instance();
+    memory->SetCpuVolatileRange(reinterpret_cast<VAddr>(fiber),
+                               reinterpret_cast<VAddr>(addr_context), size_context);
+    memory->PrepareCpuVolatileRange(reinterpret_cast<VAddr>(addr_context), size_context);
 
     u32 user_flags = flags;
     if (build_ver >= Common::ElfInfo::FW_350) {
@@ -253,6 +325,7 @@ s32 PS4_SYSV_ABI sceFiberFinalize(OrbisFiber* fiber) {
     if (!fiber->state.compare_exchange_strong(expected, FiberState::Terminated)) {
         return ORBIS_FIBER_ERROR_STATE;
     }
+    Core::Memory::Instance()->SetCpuVolatileRange(reinterpret_cast<VAddr>(fiber), 0, 0);
 
     return ORBIS_OK;
 }
@@ -276,7 +349,7 @@ s32 PS4_SYSV_ABI sceFiberRunImpl(OrbisFiber* fiber, void* addr_context, u64 size
 
     /* Caller wants to attach context and run. */
     if (addr_context != nullptr || size_context != 0) {
-        s32 res = _sceFiberAttachContext(fiber, addr_context, size_context);
+        s32 res = ValidateAttachContext(fiber, addr_context, size_context);
         if (res < 0) {
             return res;
         }
@@ -287,7 +360,18 @@ s32 PS4_SYSV_ABI sceFiberRunImpl(OrbisFiber* fiber, void* addr_context, u64 size
         return ORBIS_FIBER_ERROR_STATE;
     }
 
-    OrbisFiberContext ctx{};
+    // Capture the actual caller stack, including SA_ONSTACK and other alternate-stack callers.
+    // Retain its owner until Run returns; the pthread attributes may describe a different stack.
+    OrbisFiberContext ctx;
+    const auto thread_stack = GetThreadContextStack(reinterpret_cast<VAddr>(&ctx));
+    auto* memory = Core::Memory::Instance();
+    memory->SetCpuVolatileRange(reinterpret_cast<VAddr>(&ctx), thread_stack.address,
+                               thread_stack.size);
+    memory->PrepareCpuVolatileRange(thread_stack.address, thread_stack.size);
+    if (addr_context != nullptr || size_context != 0) {
+        AttachContext(fiber, addr_context, size_context);
+    }
+    ctx = {};
     ctx.current_fiber = fiber;
     ctx.prev_fiber = nullptr;
     ctx.return_val = 0;
@@ -330,6 +414,7 @@ s32 PS4_SYSV_ABI sceFiberRunImpl(OrbisFiber* fiber, void* addr_context, u64 size
     }
 
     tcb->tcb_fiber = nullptr;
+    memory->SetCpuVolatileRange(reinterpret_cast<VAddr>(&ctx), 0, 0);
     return ORBIS_OK;
 }
 
@@ -352,7 +437,7 @@ s32 PS4_SYSV_ABI sceFiberSwitchImpl(OrbisFiber* fiber, void* addr_context, u64 s
 
     /* Caller wants to attach context and switch. */
     if (addr_context != nullptr || size_context != 0) {
-        s32 res = _sceFiberAttachContext(fiber, addr_context, size_context);
+        s32 res = ValidateAttachContext(fiber, addr_context, size_context);
         if (res < 0) {
             return res;
         }
@@ -361,6 +446,11 @@ s32 PS4_SYSV_ABI sceFiberSwitchImpl(OrbisFiber* fiber, void* addr_context, u64 s
     FiberState expected = FiberState::Idle;
     if (!fiber->state.compare_exchange_strong(expected, FiberState::Run)) {
         return ORBIS_FIBER_ERROR_STATE;
+    }
+
+    PrepareCurrentContext();
+    if (addr_context != nullptr || size_context != 0) {
+        AttachContext(fiber, addr_context, size_context);
     }
 
     OrbisFiber* cur_fiber = g_ctx->current_fiber;
@@ -410,6 +500,9 @@ s32 PS4_SYSV_ABI sceFiberReturnToThread(u64 arg_on_return, u64* arg_on_run) {
     if (!g_ctx) {
         return ORBIS_FIBER_ERROR_PERMISSION;
     }
+
+    // Acquire the source before saving registers or checking its stack signature.
+    PrepareCurrentContext();
 
     OrbisFiber* cur_fiber = g_ctx->current_fiber;
     if (cur_fiber->addr_context) {

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <unordered_map>
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -77,7 +78,9 @@ public:
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);
-    void UnmapMemory(VAddr addr, u64 size);
+    void UnmapMemory(VAddr addr, u64 size, bool retire_cpu_ranges);
+    void SetCpuVolatileRange(VAddr owner, VAddr address, u64 size);
+    void PrepareCpuVolatileRange(VAddr address, u64 size);
 
     u64 Flush();
     void Finish();
@@ -103,6 +106,8 @@ public:
 #endif
 
 private:
+    void AcquireCpuVolatileRange(VAddr address, u64 size);
+    void RemoveCpuVolatileOwners(VAddr address, u64 size);
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();
@@ -145,6 +150,11 @@ private:
     Core::MemoryManager* memory;
     boost::icl::interval_set<VAddr> mapped_ranges;
     Common::SharedFirstMutex mapped_ranges_mutex;
+    struct CpuVolatileRange {
+        VAddr address;
+        u64 size;
+    };
+    std::unordered_map<VAddr, CpuVolatileRange> cpu_volatile_ranges;
     PipelineCache pipeline_cache;
     const bool host_markers_enabled;
     const bool guest_markers_enabled;
@@ -171,6 +181,7 @@ private:
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
     bool attachment_feedback_loop{};
     bool needs_barrier{};
+    bool dma_bound{};
 };
 
 } // namespace Vulkan

@@ -131,7 +131,12 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
     size.width = image.width + 1;
     size.height = image.height + 1;
     size.depth = props.is_volume ? image.depth + 1 : 1;
-    pitch = image.Pitch();
+    // Thin surfaces ignore the T# pitch field: hardware lays them out one row per
+    // `width` pixels. Trusting a pitch that disagrees with the width makes
+    // UpdateSize() size the tiled footprint larger than the real image, and
+    // DetileImage then walks past the image into unrelated guest memory.
+    pitch = AmdGpu::GetMicroTileMode(tile_mode) == AmdGpu::MicroTileMode::Thin ? size.width
+                                                                                : image.Pitch();
     resources.levels = image.NumLevels();
     resources.layers = image.NumLayers();
     num_samples = image.NumSamples();
@@ -151,9 +156,7 @@ bool ImageInfo::IsCompatible(const ImageInfo& info) const {
 }
 
 void ImageInfo::UpdateSize() {
-    if (array_mode == AmdGpu::ArrayMode::ArrayLinearGeneral) {
-        UNREACHABLE_MSG("Unhandled array mode: ArrayLinearGeneral");
-    }
+    const bool linear_general = array_mode == AmdGpu::ArrayMode::ArrayLinearGeneral;
     const u32 thickness = AmdGpu::GetMicroTileThickness(array_mode);
     const bool macro = AmdGpu::IsMacroTiled(array_mode);
     guest_size = 0;
@@ -175,7 +178,12 @@ void ImageInfo::UpdateSize() {
         }
 
         auto& mip_info = mips_layout[mip];
-        if (array_mode == AmdGpu::ArrayMode::ArrayLinearAligned) {
+        if (linear_general) {
+            // Linear general is already the exact surface layout: no pitch or height alignment.
+            mip_info.pitch = mip_w;
+            mip_info.height = mip_h;
+            mip_info.size = (static_cast<size_t>(mip_w) * mip_h * num_bits * num_samples) / 8;
+        } else if (array_mode == AmdGpu::ArrayMode::ArrayLinearAligned) {
             std::tie(mip_info.pitch, mip_info.height, mip_info.size) =
                 ImageSizeLinearAligned(mip_w, mip_h, num_bits, num_samples);
         } else {

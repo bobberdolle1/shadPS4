@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include "common/alignment.h"
@@ -29,6 +30,18 @@ class PageManager {
     static constexpr size_t PM_PAGE_SIZE = 1ULL << PM_PAGE_BITS;
 
 public:
+    static constexpr size_t ADDRESS_BITS = 40;
+    static constexpr VAddr ADDRESS_SPACE_SIZE = VAddr{1} << ADDRESS_BITS;
+
+    static constexpr bool IsGpuAddressableRange(VAddr address, u64 size) {
+        return size != 0 && address < ADDRESS_SPACE_SIZE &&
+               size <= ADDRESS_SPACE_SIZE - address;
+    }
+
+    static constexpr u64 ClampGpuRangeSize(VAddr address, u64 size) {
+        return address < ADDRESS_SPACE_SIZE ? std::min(size, ADDRESS_SPACE_SIZE - address) : 0;
+    }
+
     explicit PageManager(Vulkan::Rasterizer* rasterizer);
     ~PageManager();
 
@@ -37,6 +50,10 @@ public:
 
     /// Unregister a range of gpu memory that was unmapped.
     void OnGpuUnmap(VAddr address, size_t size);
+
+    /// Pins effective access without changing either watcher count.
+    void UpdateCpuVolatileRange(VAddr address, u64 size, bool add);
+    bool IsCpuVolatile(VAddr address) const;
 
     /// Updates watches in the pages touching the specified region.
     void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) const;
