@@ -486,12 +486,21 @@ void ApplyScriptedPad(Input::State& state) {
     if (!active) {
         return;
     }
+    // A row that asks for nothing must not clobber the real controller. Forcing Cross to
+    // zero for the whole loading sequence is what left the game sitting on a black frame:
+    // the title screen stopped advancing. Neutral means "hand the pad back".
+    if (active->cross == 0 && active->r2 == 0 && active->l2 == 0 && active->lx == 128) {
+        return;
+    }
     using Axis = Input::Axis;
     state.axes[static_cast<u32>(Axis::TriggerRight)] = active->r2;
     state.axes[static_cast<u32>(Axis::TriggerLeft)] = active->l2;
     state.axes[static_cast<u32>(Axis::LeftX)] = active->lx;
-    state.buttonsState = active->cross != 0 ? Libraries::Pad::OrbisPadButtonDataOffset::Cross
-                                            : Libraries::Pad::OrbisPadButtonDataOffset(0);
+    // Only ever add a button; clearing the whole mask would drop whatever else the real
+    // controller is reporting.
+    if (active->cross != 0) {
+        state.buttonsState = state.buttonsState | Libraries::Pad::OrbisPadButtonDataOffset::Cross;
+    }
 }
 } // namespace
 
