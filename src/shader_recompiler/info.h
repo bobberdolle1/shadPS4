@@ -167,6 +167,15 @@ struct Info : InfoPersistent {
     void RefreshFlatBuf() {
         flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
+        // Start from a known state. The SRT walker only writes the descriptor slots it
+        // could resolve; anything it skips (for example an offset expression rooted at a
+        // Phi, which ComputeOffset cannot model) would otherwise keep the value from a
+        // previous dispatch. A descriptor read at an unresolved location falls back to
+        // flatbuf[0], i.e. the live user-data registers, so a stale slot is not garbage -
+        // it is this shader's own uniforms reinterpreted as a T#, which is exactly how
+        // implausible addresses like 0x3f80000000 (= 1.0f << 8) arise. Zeros mean
+        // "address 0", which the rasterizer already binds as an empty image.
+        std::memset(flattened_ud_buf.data(), 0, flattened_ud_buf.size() * sizeof(u32));
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
         if (srt_info.walker_func) {
             srt_info.walker_func(user_data.data(), flattened_ud_buf.data());

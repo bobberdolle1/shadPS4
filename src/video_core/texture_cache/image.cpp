@@ -264,8 +264,22 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                                            subres_range->base.layer + subres_range->extent.layers)
                 : std::views::iota(0u, info.resources.layers);
 
+        // A descriptor that resolved to garbage can carry an absurd layer count, and the
+        // index below is mip * layers + layer, so both loops must stay within the number of
+        // subresources that actually exist. Without this the barrier loop indexes past
+        // subresource_states and faults.
+        const u64 num_subresources = subresource_states.size();
+        if (num_subresources == 0) {
+            return;
+        }
         for (u32 mip : mips) {
+            if (static_cast<u64>(mip) * info.resources.layers >= num_subresources) {
+                break;
+            }
             for (u32 layer : layers) {
+                if (static_cast<u64>(mip) * info.resources.layers + layer >= num_subresources) {
+                    break;
+                }
                 // NOTE: these loops may produce a lot of small barriers.
                 // If this becomes a problem, we can optimize it by merging adjacent barriers.
                 const auto subres_idx = mip * info.resources.layers + layer;
