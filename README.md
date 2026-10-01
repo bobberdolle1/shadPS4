@@ -32,6 +32,49 @@ SPDX-License-Identifier: GPL-2.0-or-later
 | :------------------------------------------------------------------------: | :------------------------------------------------------------------: |
 | ![Yakuza screenshot](./documents/Screenshots/3.png) | ![DRIVECLUB screenshot](./documents/Screenshots/4.png) |
 
+
+---
+
+## Fork research notes: CUSA49696 (*My First Gran Turismo* v01.01)
+
+This fork carries a focused investigation into **CUSA49696**, base PKG plus update,
+extracted into `CUSA49696` and `CUSA49696-patch`.
+
+**Works:** boots, menus, track flyover, race start. Sky, vegetation, asphalt, lighting,
+shadows and UI text render with textures. No crashes in the last verified runs.
+
+**Broken:** large surfaces render flat and untextured, and UI panels draw over empty
+geometry. This is the main open item and is *not* fixed.
+
+**Measured FPS:** 22–28 in menus and the track flyover, **~6.5 in a race**. The menus
+figure was ~5 before the DMA-sync work; `SynchronizeDmaBuffers` had been walking all 5390
+mapped guest ranges and 65293 cached blocks per DMA draw and now only processes what the
+CPU actually wrote. The race figure is unchanged and dominates what is left.
+
+**Root cause found (crashes, fixed):** the SRT walker could not compute descriptor offsets
+for `Phi`, so slots were never written and later reads fell through to live shader SGPRs.
+Those SGPRs produced the bogus `T#` texture ids in the UI, which decoded to
+`layers = 32768` and overflowed the subresource array — that was the `0xC0000005`. Fixed by
+zeroing unflattened descriptor slots and bounding the barrier loop by the real subresource
+count.
+
+**Root cause found (textures, open):** `ComputeOffset` evaluates descriptor offsets
+*statically*, once per walker. `GetAttributeU32` carries a **per-vertex** index, which no
+static arithmetic can fold. Measured with per-shader counters: **21–33% of descriptor
+offsets fail on every shader, ~22% typical**, which matches what is missing on screen.
+
+**Relation to [nikmparis217-ux/shadPS4](https://github.com/nikmparis217-ux/shadPS4):** that
+GT7 tree does not resolve one offset at generation time — it copies a window of
+descriptors into a flat buffer (base and size from userdata) and lets the shader index it
+at draw time. Parts of it are already ported here. For CUSA49696 that window approach is
+the only mechanism that can yield a per-vertex index, so it is the queued next step.
+
+Full write-up, measurements, dead ends and how to reproduce:
+**[documents/cusa49696-research.md](./documents/cusa49696-research.md)**.
+
+Tags: `cusa49696-first-race`, `cusa49696-perf-27fps`, `cusa49696-final-research`.
+
+---
 # General information
 
 **shadPS4** is an early **PlayStation 4** emulator for **Windows**, **Linux** and **macOS** written in C++.
