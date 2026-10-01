@@ -876,10 +876,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     auto base_addr = reinterpret_cast<VAddr>(acb.data());
     size_t acb_size = acb.size_bytes();
     // Diagnostic CPU-backing snapshot: no GPU acquisition or command-byte mutation.
-    std::array<u32, 1024> entry_words;
-    const u32 entry_count = static_cast<u32>(std::min(acb.size(), entry_words.size()));
-    Core::Memory::Instance()->CopySparseMemory(
-        base_addr, reinterpret_cast<u8*>(entry_words.data()), entry_count * sizeof(u32));
+    constexpr size_t entry_words_size = 1024;
+    std::array<u32, entry_words_size> entry_words;
+    // Only needed while chasing an invalid PM4 header, and it copies up to 4 KiB of guest
+    // memory on every compute submission, so keep it off the hot path by default.
+    static const bool pm4_dump_enabled = std::getenv("CUSA49696_PM4_DUMP") != nullptr;
+    const u32 entry_count =
+        pm4_dump_enabled ? static_cast<u32>(std::min(acb.size(), entry_words_size)) : 0;
+    if (entry_count > 0) {
+        Core::Memory::Instance()->CopySparseMemory(
+            base_addr, reinterpret_cast<u8*>(entry_words.data()), entry_count * sizeof(u32));
+    }
     struct PacketTrace {
         u32 offset;
         u32 raw;

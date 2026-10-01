@@ -1,0 +1,41 @@
+import json
+from pathlib import Path
+import sys
+import renderdoc as rd
+
+root = Path('E:/programming/shadPS4/autonomous_logs/xhigh-renderdoc-title-65s')
+meta = json.loads((root / 'result.json').read_text())
+cap = rd.OpenCaptureFile()
+controller = None
+result = {}
+try:
+    status = cap.OpenFile(meta['capture'], '', None)
+    status, controller = cap.OpenCapture(rd.ReplayOptions(), None)
+    controller.SetFrameEvent(11035, True)
+    pipe = controller.GetVulkanPipelineState()
+    refl = pipe.fragmentShader.reflection
+    inputs = rd.DebugPixelInputs()
+    inputs.primitive = 0
+    trace = controller.DebugPixel(100, 650, inputs)
+    if trace.debugger:
+        states = []
+        while True:
+            more = controller.ContinueDebug(trace.debugger)
+            if not more:
+                break
+            states.extend(more)
+        result['steps'] = len(states)
+        changes = []
+        for s in states:
+            for ch in s.changes:
+                changes.append({'step': s.stepIndex, 'inst': s.nextInstruction, 'before': ch.before.name, 'after': ch.after.name, 'value': list(ch.after.value.f32v[0:4]) if ch.after.value else None})
+        result['changes'] = changes
+        controller.FreeTrace(trace)
+except Exception as exc:
+    result['error'] = str(exc)
+finally:
+    if controller is not None:
+        controller.Shutdown()
+    cap.Shutdown()
+    (root / 'debug_pp_pass_11035.json').write_text(json.dumps(result, indent=2))
+sys.exit(0 if 'error' not in result else 1)

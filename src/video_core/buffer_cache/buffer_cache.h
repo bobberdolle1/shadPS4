@@ -105,6 +105,14 @@ public:
     void SynchronizeDmaBuffers();
     void RegisterDmaReads(vk::PipelineStageFlags2 stage);
 
+    /// Records that the CPU wrote [address, address+size) so the next DMA draw uploads it.
+    void LogDmaDirty(VAddr address, u64 size);
+
+    /// Narrows readable_ranges to the ranges the CPU wrote since the previous DMA draw.
+    /// Returns false when nothing became dirty, meaning the caller can skip the per-block
+    /// residency and upload passes entirely.
+    bool ConsumeDmaDirtyLog(std::vector<std::pair<VAddr, u64>>& readable_ranges);
+
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
@@ -168,6 +176,9 @@ private:
     };
     IntervalList<Backing> resident_ranges;
     std::vector<std::pair<VAddr, u64>> dma_backing_ranges;
+    std::mutex dma_dirty_mutex;
+    RangeSet dma_dirty_log;
+    bool dma_dirty_seeded = false;
 
     u32 arena_memory_type_index{};
     u32 block_size{};

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
@@ -21,6 +23,36 @@
 #include <vk_mem_alloc.h>
 
 namespace VideoCore {
+namespace {
+// DMA sync diagnostics. Set CUSA49696_DMA_STATS=1 to log a rolling summary of the
+// per-draw cost of SynchronizeDmaBuffers. Off by default so the common path is untouched.
+bool DmaStatsEnabled() {
+    static const bool enabled = std::getenv("CUSA49696_DMA_STATS") != nullptr;
+    return enabled;
+}
+
+/// Frames counted by BufferCache::TickFrame, shared with the rolling report below.
+std::atomic<u64> g_dma_stats_frames{};
+
+struct DmaSyncStats {
+    u64 draws{};
+    u64 total_ns{};
+    u64 range_total{};
+    u64 block_total{};
+    u64 resident_total{};
+    u64 last_report{};
+    u64 last_frames{};
+
+    void Reset() {
+        draws = 0;
+        total_ns = 0;
+        range_total = 0;
+        block_total = 0;
+        resident_total = 0;
+        last_frames = g_dma_stats_frames.load(std::memory_order_relaxed);
+    }
+};
+} // namespace
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
@@ -92,10 +124,16 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 BufferCache::~BufferCache() = default;
 
 void BufferCache::TickFrame() {
+    // TickFrame runs once per presented frame, so it gives the DMA stats a real FPS
+    // denominator. Diagnostics only.
+    if (DmaStatsEnabled()) {
+        g_dma_stats_frames.fetch_add(1, std::memory_order_relaxed);
+    }
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
     }
 }
+
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
@@ -120,6 +158,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         DownloadMemory(arena, window_start, window_end - window_start);
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+            LogDmaDirty(device_addr, size);
         }
     };
     if (assume_locks) {
@@ -217,6 +256,7 @@ void BufferCache::RefreshCpuVolatile(VAddr address, u64 size) {
 
 void BufferCache::MarkCpuModified(VAddr address, u64 size) {
     memory_tracker->MarkRegionAsCpuModified(address, size);
+    LogDmaDirty(address, size);
 }
 
 bool BufferCache::IsRegionCpuVolatile(VAddr address, u64 size) {
@@ -241,10 +281,56 @@ bool BufferCache::DownloadImage(Image& image) {
     return false;
 }
 
+// Incremental DMA sync. GT_DMA_DIRTY=1 restricts each draw's upload to the ranges the CPU
+// actually wrote since the previous draw, instead of walking every mapped range.
+bool DmaDirtyEnabled() {
+    static const bool enabled = std::getenv("GT_DMA_DIRTY") != nullptr;
+    return enabled;
+}
+
+void BufferCache::LogDmaDirty(VAddr address, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    std::scoped_lock lock{dma_dirty_mutex};
+    dma_dirty_log.Add(address, size);
+}
+
+bool BufferCache::ConsumeDmaDirtyLog(std::vector<std::pair<VAddr, u64>>& readable_ranges) {
+    RangeSet dirty;
+    {
+        std::scoped_lock lock{dma_dirty_mutex};
+        // Before the first draw there is no history, so keep everything readable.
+        if (dma_dirty_seeded && dma_dirty_log.Empty()) {
+            return false;
+        }
+        std::swap(dirty, dma_dirty_log);
+        dma_dirty_seeded = true;
+    }
+
+    // Intersect what the CPU wrote with what is GPU-readable right now. Uploading is still
+    // driven by the readable set, so residency and upload keep exactly the guarantees the
+    // full scan gave them; only the amount of memory walked changes.
+    std::vector<std::pair<VAddr, u64>> narrowed;
+    for (const auto& [base, size] : readable_ranges) {
+        dirty.ForEachInRange(base, size, [&narrowed](VAddr begin, VAddr end) {
+            narrowed.emplace_back(begin, end - begin);
+        });
+    }
+    readable_ranges.swap(narrowed);
+    return true;
+}
+
 void BufferCache::SynchronizeDmaBuffers() {
+    const bool stats = DmaStatsEnabled();
+    const u64 start_ns = stats ? std::chrono::steady_clock::now().time_since_epoch().count() : 0;
+    u64 blocks = 0;
     // Dynamic addresses cannot be flattened on the CPU. Populate committed GPU backing
     // before their first shader read; sparse PRT reservations have no data to upload.
     memory->GetGpuReadableMemoryRanges(dma_backing_ranges);
+    if (DmaDirtyEnabled()) {
+        ConsumeDmaDirtyLog(dma_backing_ranges);
+    }
     for (const auto& [address, size] : dma_backing_ranges) {
         u64 first_block = address >> block_shift;
         const u64 end_block = Common::AlignUp(size + address, u64{block_size}) >> block_shift;
@@ -254,6 +340,7 @@ void BufferCache::SynchronizeDmaBuffers() {
                 blocks_per_arena_page;
             const u64 last_block = std::min(end_block, arena_end) - 1;
             EnsureResident(GetArena(first_block, last_block), first_block, last_block);
+            blocks += last_block - first_block + 1;
             first_block = last_block + 1;
         }
     }
@@ -273,6 +360,34 @@ void BufferCache::SynchronizeDmaBuffers() {
     }
     if (runtime.HasPendingBufferWrites()) {
         runtime.FlushBarriers();
+    }
+
+    if (stats) {
+        static DmaSyncStats s{};
+        s.draws++;
+        s.total_ns +=
+            static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count()) - start_ns;
+        s.range_total += dma_backing_ranges.size();
+        s.block_total += blocks;
+        s.resident_total += resident_ranges.Size();
+        const u64 now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+        if (now_ns - s.last_report > 2'000'000'000ULL) {
+            const u64 frames =
+                g_dma_stats_frames.load(std::memory_order_relaxed) - s.last_frames;
+            const double window_s = static_cast<double>(now_ns - s.last_report) / 1e9;
+            LOG_INFO(Render,
+                     "DMA_SYNC_STATS draws={} draws_per_frame={:.1} fps={:.2} scan_ms={:.2} "
+                     "dma_pct_of_wall={:.1} ms_per_draw={:.4} mapped_range_count={} "
+                     "blocks_per_draw={} cached_buffer_count={}",
+                     s.draws, static_cast<double>(s.draws) / static_cast<double>(frames ? frames : 1),
+                     static_cast<double>(frames) / window_s,
+                     static_cast<double>(s.total_ns) / 1e6,
+                     100.0 * static_cast<double>(s.total_ns) / 1e9 / window_s,
+                     static_cast<double>(s.total_ns) / 1e6 / static_cast<double>(s.draws),
+                     s.range_total / s.draws, s.block_total / s.draws, s.resident_total / s.draws);
+            s.Reset();
+            s.last_report = now_ns;
+        }
     }
 }
 
