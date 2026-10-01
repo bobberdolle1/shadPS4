@@ -839,7 +839,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
-    for (const auto& image_desc : stage.images) {
+    // Set CUSA49696_TRACE_BAD_TSHARP=1 to dump full provenance for the first rejected
+    // descriptors: which shader, which stage, which resource slot, and the raw 32 bytes
+    // that came out of the flattened user-data buffer.
+    static const bool trace_bad_tsharp = std::getenv("CUSA49696_TRACE_BAD_TSHARP") != nullptr;
+    static u32 bad_tsharp_traced = 0;
+
+    for (u32 image_index = 0; image_index < stage.images.size(); ++image_index) {
+        const auto& image_desc = stage.images[image_index];
         const auto tsharp = image_desc.GetSharp(stage);
         if (texture_cache.IsMeta(tsharp.Address())) {
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
@@ -860,6 +867,17 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         "data_format={}, num_format={}",
                         tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
                         static_cast<u32>(num_fmt));
+            if (trace_bad_tsharp && bad_tsharp_traced < 64) {
+                ++bad_tsharp_traced;
+                const auto* raw = reinterpret_cast<const u32*>(&tsharp);
+                LOG_WARNING(Render_Vulkan,
+                            "BAD_TSHARP shader={:#x} stage={} index={} images={} flatbuf_dw={} "
+                            "raw=[{:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} "
+                            "{:#010x} {:#010x}]",
+                            stage.pgm_hash, static_cast<u32>(stage.hw_stage), image_index,
+                            stage.images.size(), stage.flattened_ud_buf.size(), raw[0], raw[1],
+                            raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
+            }
             image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
             image_descriptor_array_sizes.push_back(1);
             continue;
